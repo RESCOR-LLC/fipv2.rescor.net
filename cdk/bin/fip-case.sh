@@ -26,6 +26,8 @@ Usage:
   fip case show    <case | --ticket T> [--verify]
   fip case ticket  <case | --ticket T> T [--comment C]
   fip case comment <case | --ticket T> C
+  fip case move    <member>... (--to <case> | --ticket T) --comment C
+  fip case merge   <into> <from>... --comment C
 
 An incident case groups the isolations of one incident, with its tickets and
 comments. Use one when the incident is still unfolding; for a known, single
@@ -38,9 +40,16 @@ isolation, `fip isolate` alone is enough (manual §5.1).
             --verify prints the check for each record.
   ticket    Add a ticket from your own system. A case may carry several.
   comment   Add a signed, permanent comment.
+  move      Move members to another open case. A member is one target of an
+            isolation run (fip-.../i-...); fip-... is every target of that run,
+            case-... every member of that case. Recorded in both cases' logs.
+            Nothing is relocated, and no host is touched.
+  merge     Move every member of each <from> case into <into>; each <from>
+            becomes an alias of <into>, and its tickets are copied across.
+            There is no unmerge: move the members back instead.
 
 Wherever a case is named, --ticket T also works if exactly one case carries
-that ticket.
+that ticket. Naming a merged case acts on the case it merged into, and says so.
 
 Isolations join a case only when named: fip isolate --case C (or --ticket T).
 Each such run's targets are recorded in the case's log as MEMBER_ATTACHED.
@@ -200,18 +209,31 @@ cmd_show() {
       "State ........... \(.state.S // "?")",
       "Opened .......... \(.openedAt.S // "?")  by \(.openedBy.S // "?")",
       "Tickets ......... " + ((.tickets.SS // []) | if length > 0 then join(", ") else "none" end),
+      (if .mergedFrom then "Merged in ....... " + (.mergedFrom.SS | join(", ")) else empty end),
       "Members ......... " + ((.members.M // {}) | length | tostring),
       ((.members.M // {}) | to_entries | sort_by(.key)[]
         | "  \(.key)  account \(.value.M.accountId.S // "?")")
     ' <<<"$row"
     echo
     echo "Timeline:"
-    jq -r '.records[] |
+    jq -r --arg id "$id" '
+      def members: (.members // []) | map("\n        \(.member // "\(.accountId):\(.instanceId)")") | join("");
+      .records[] |
       "  \(.seq // "?")  \(.at // "?")  \(.event // "?")"
+      + (if .aborted then "  (WITHDRAWN: see the ABORTED record below)" else "" end)
       + (if .event == "OPENED" and ((.tickets // []) | length) > 0 then "  tickets \(.tickets | join(", "))" else "" end)
       + (if .event == "TICKET_ADDED" then "  \(.ticket)" else "" end)
       + (if .event == "MEMBER_ATTACHED" then "  \(.actionId)"
-           + ((.members // [])[] | "\n        \(.accountId):\(.instanceId)") else "" end)
+           + ((.members // []) | map("\n        \(.accountId):\(.instanceId)") | join("")) else "" end)
+      + (if .event == "MEMBER_MOVED" then
+           (if .to == $id then "  in from \(.from // "no case")" else "  out to \(.to)" end)
+           + (if .via == "merge" then " (merge)" else "" end) + members
+         else "" end)
+      + (if .event == "MERGED" then
+           (if .mergedInto then "  into \(.mergedInto); this case is now its alias"
+            else "  absorbed \(.absorbed)" + (if ((.tickets // []) | length) > 0 then ", tickets \(.tickets | join(", "))" else "" end) end)
+         else "" end)
+      + (if .event == "ABORTED" then "  withdraws record \(.aborts.seq) (\(.aborts.event // "?"))\n        \(.reason // "")" else "" end)
       + (if .comment then "\n        \(.comment)" else "" end)
       + "\n        by \(.actor // "?")"
     ' "$WORK_DIR/log.json"
@@ -271,8 +293,59 @@ cmd_comment() {
     echo "Comment recorded in case $id, record $seq. It is signed and permanent."
 }
 
+cmd_move() {
+    local to="" by="" comment="" members='[]'
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --to)      to="${2:?--to needs a case}"; shift 2 ;;
+            --ticket)  by="${2:?--ticket needs a value}"; shift 2 ;;
+            --comment) comment="${2:?--comment needs text}"; shift 2 ;;
+            -*) echo "ERROR: unknown option '$1'" >&2; usage; exit 2 ;;
+            *) members="$(jq -c --arg m "$1" '. + [$m]' <<<"$members")"; shift ;;
+        esac
+    done
+    [ "$members" != "[]" ] || { echo "ERROR: name what to move (fip-.../i-..., fip-... or case-...)" >&2; exit 2; }
+    [ -n "$comment" ] || { echo "ERROR: --comment is required: a move is part of the record" >&2; exit 2; }
+    to="$(resolve "$to" "$by")"
+    local result
+    result="$(invoke "$(jq -cn --arg to "$to" --arg actor "$(actor)" --arg c "$comment" --argjson m "$members" \
+        '{action: "case", op: "move", caseId: $to, actor: $actor, members: $m, comment: $c}')")"
+    jq -r '.moves[] | "Moved to \(.to) from \(.from // "no case"):", (.members[] | "  \(.)")' <<<"$result"
+    echo "Recorded in each case's log. fip case show $to"
+}
+
+cmd_merge() {
+    local comment="" ids=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --comment) comment="${2:?--comment needs text}"; shift 2 ;;
+            -*) echo "ERROR: unknown option '$1'" >&2; usage; exit 2 ;;
+            *) ids+=("$1"); shift ;;
+        esac
+    done
+    [ "${#ids[@]}" -ge 2 ] || { echo "ERROR: name the case to keep, then the case(s) to merge into it" >&2; exit 2; }
+    [ -n "$comment" ] || { echo "ERROR: --comment is required: a merge is part of the record" >&2; exit 2; }
+    # Each argument is a case id or, failing that, a ticket exactly one case carries.
+    local named=() a into
+    for a in "${ids[@]}"; do
+        case "$a" in case-*) named+=("$(resolve "$a" "")") ;; *) named+=("$(resolve "" "$a")") ;; esac
+    done
+    into="${named[0]}"
+    local from
+    from="$(printf '%s\n' "${named[@]:1}" | jq -R . | jq -sc .)"
+    local result
+    result="$(invoke "$(jq -cn --arg into "$into" --arg actor "$(actor)" --arg c "$comment" --argjson from "$from" \
+        '{action: "case", op: "merge", caseId: $into, actor: $actor, from: $from, comment: $c}')")"
+    jq -r '.merged[] | "Merged \(.from) into \(.into)"
+        + ", moving \([.moves[].members | length] | add // 0) member(s)"
+        + (if (.tickets | length) > 0 then " and tickets \(.tickets | join(", "))" else "" end)' <<<"$result"
+    echo "Each merged case is now an alias of $into. fip case show $into"
+}
+
 case "$VERB" in
     open)    cmd_open "$@" ;;
+    move)    cmd_move "$@" ;;
+    merge)   cmd_merge "$@" ;;
     list)    cmd_list "$@" ;;
     show)    cmd_show "$@" ;;
     ticket)  cmd_ticket "$@" ;;

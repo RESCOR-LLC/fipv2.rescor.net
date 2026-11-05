@@ -32,7 +32,7 @@ import {
 } from '@aws-sdk/client-kms';
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import {
-  DynamoDBClient, PutItemCommand, UpdateItemCommand, GetItemCommand,
+  DynamoDBClient, PutItemCommand, UpdateItemCommand, GetItemCommand, TransactWriteItemsCommand,
 } from '@aws-sdk/client-dynamodb';
 import { CopySnapshotCommand } from '@aws-sdk/client-ec2';
 import { EBSClient, ListSnapshotBlocksCommand, GetSnapshotBlockCommand } from '@aws-sdk/client-ebs';
@@ -40,6 +40,7 @@ import { createHash, verify as cryptoVerify } from 'node:crypto';
 import {
   isCaseId, caseLogKey, sha256Hex, checkTicket, checkComment, buildCaseEvent,
   rowUpdateFor, signedDocument, summarizeAction, attachedMembers,
+  parseMemberSpec, targetsOfAction, locateMember, memberId, moveTransaction, mergeTransaction,
 } from './case-log.mjs';
 
 const REGION = process.env.AWS_REGION;
@@ -896,10 +897,31 @@ async function caseOpen(event, creds) {
   const attach = async () => {
     if (!incident) return null;
     // Idempotent: a retried OpenCase, or a re-run naming targets already
-    // attached, records only what the case does not hold yet.
+    // attached, records only what the case does not hold yet. A member a
+    // later `fip case move` placed in another case stays there.
     const have = (await readCaseRow(ddb, incident))?.members?.M ?? {};
-    const missing = members.filter((m) => !have[m.member]);
+    const placed = (await readCaseRow(ddb, caseId))?.cases?.M ?? {};
+    const missing = members.filter((m) => !have[m.member]
+      && (!placed[m.instanceId] || placed[m.instanceId].S === incident));
     if (!missing.length) return null;
+    // Where each member is, on the run's row, before the record: a move
+    // reads it, and conditions on it.
+    await ensureCasesMap(ddb, caseId);
+    const names = { '#cases': 'cases' };
+    const sets = [];
+    const conds = [];
+    missing.forEach((m, i) => {
+      names[`#i${i}`] = m.instanceId;
+      sets.push(`#cases.#i${i} = :incident`);
+      conds.push(`(attribute_not_exists(#cases.#i${i}) OR #cases.#i${i} = :incident)`);
+    });
+    await ddb.send(new UpdateItemCommand({
+      TableName: CASE_TABLE, Key: { caseId: { S: caseId } },
+      UpdateExpression: `SET ${sets.join(', ')}`,
+      ConditionExpression: conds.join(' AND '),
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: { ':incident': { S: incident } },
+    }));
     return appendCaseEvent({
       caseId: incident, event: 'MEMBER_ATTACHED', actor,
       data: { actionId: caseId, executionArn: openedBy ?? null, members: missing },
@@ -927,6 +949,7 @@ async function caseOpen(event, creds) {
           })),
         },
         targets: { M: {} },
+        cases: { M: {} },
         ...(incident ? { incident: { S: incident } } : {}),
       },
       ConditionExpression: 'attribute_not_exists(caseId)',
@@ -1215,6 +1238,19 @@ async function readCaseRow(ddb, caseId) {
   return Item ?? null;
 }
 
+const MEMBERSHIP_EVENTS = new Set(['MEMBER_ATTACHED', 'MEMBER_MOVED', 'MERGED']);
+
+/** A run's row gains its `cases` map if it predates it. A nested SET needs the parent. */
+async function ensureCasesMap(ddb, actionId) {
+  await ddb.send(new UpdateItemCommand({
+    TableName: CASE_TABLE, Key: { caseId: { S: actionId } },
+    UpdateExpression: 'SET #cases = if_not_exists(#cases, :empty)',
+    ConditionExpression: 'attribute_exists(caseId)',
+    ExpressionAttributeNames: { '#cases': 'cases' },
+    ExpressionAttributeValues: { ':empty': { M: {} } },
+  }));
+}
+
 async function applyToRow(ddb, caseId, doc, sha256) {
   try {
     await ddb.send(new UpdateItemCommand({
@@ -1239,10 +1275,11 @@ async function appendCaseEvent({ caseId, event, data, actor }, creds) {
   for (let attempt = 0; attempt < 8; attempt++) {
     const row = await readCaseRow(ddb, caseId);
     if (!row || row.kind?.S !== 'case') throw new Error(`no incident case ${caseId}`);
-    // Re-checked on every attempt, so a case closed between the caller's own
-    // check and this write does not gain a member.
-    if (event === 'MEMBER_ATTACHED' && row.state?.S !== 'OPEN') {
-      throw new Error(`case ${caseId} is ${row.state?.S}; isolations attach only to open cases`);
+    // Re-checked on every attempt, so a case closed or merged between the
+    // caller's own check and this write does not gain or lose a member.
+    if (MEMBERSHIP_EVENTS.has(event) && row.state?.S !== 'OPEN') {
+      throw new Error(`case ${caseId} is ${row.state?.S}${row.mergedInto?.S ? ` into ${row.mergedInto.S}` : ''}; `
+        + 'membership changes only in open cases');
     }
     const last = Number(row.logSeq?.N ?? 0);
     const seq = last + 1;
@@ -1324,7 +1361,170 @@ async function caseAction(event, creds) {
     return { op, record };
   }
 
-  throw new Error(`unknown case operation '${op}' (have: open, ticket, comment)`);
+  if (op === 'move') {
+    const comment = checkComment(event.comment, { required: true });
+    const moves = await moveMembers({ to: caseId, specs: event.members ?? [], comment, actor }, creds);
+    return { op, to: caseId, moves };
+  }
+
+  if (op === 'merge') {
+    const comment = checkComment(event.comment, { required: true });
+    const froms = [...new Set(event.from ?? [])];
+    if (!froms.length) throw new Error('name at least one case to merge');
+    const merged = [];
+    // One at a time: each is complete, and recorded, before the next starts.
+    for (const from of froms) merged.push(await mergeCase({ into: caseId, from, comment, actor }, creds));
+    return { op, into: caseId, merged };
+  }
+
+  throw new Error(`unknown case operation '${op}' (have: open, ticket, comment, move, merge)`);
+}
+
+/** Why a transaction was refused, in words: which row's condition failed. */
+function cancellationReason(err, items) {
+  const reasons = err.CancellationReasons ?? [];
+  const failed = reasons
+    .map((r, i) => (r?.Code === 'ConditionalCheckFailed' ? items[i]?.Update?.Key?.caseId?.S : null))
+    .filter(Boolean);
+  return failed.length
+    ? `changed since it was read: ${failed.join(', ')} (another responder may have acted, or a case is no longer open)`
+    : (err.message ?? String(err));
+}
+
+/**
+ * Run a membership transaction whose signed records are already written.
+ * If it is refused, each record is withdrawn by a signed ABORTED note, so
+ * the log says exactly what did and did not happen.
+ */
+async function commitOrAbort(ddb, items, written, actor, creds) {
+  try {
+    await ddb.send(new TransactWriteItemsCommand({ TransactItems: items }));
+  } catch (err) {
+    if (err.name !== 'TransactionCanceledException') throw err;
+    const reason = cancellationReason(err, items);
+    for (const w of written) {
+      await appendCaseEvent({
+        caseId: w.caseId, event: 'ABORTED', actor,
+        data: { aborts: { seq: w.seq, key: w.key, event: w.event }, reason },
+      }, creds);
+    }
+    throw new Error(`refused, nothing changed: ${reason}`);
+  }
+}
+
+/**
+ * Move members to the case `to`. `specs` are as `fip case move` takes them
+ * (parseMemberSpec). Members are grouped by the case they are in now; each
+ * group is one signed record in each log and one transaction.
+ */
+async function moveMembers({ to, specs, comment, actor, via = null }, creds) {
+  const ddb = new DynamoDBClient({ region: REGION, credentials: creds });
+  const rows = new Map();
+  const row = async (id) => {
+    if (!rows.has(id)) rows.set(id, await readCaseRow(ddb, id));
+    return rows.get(id);
+  };
+  const dest = await row(to);
+  if (!dest || dest.kind?.S !== 'case') throw new Error(`no incident case ${to}`);
+  if (dest.state?.S !== 'OPEN') {
+    throw new Error(`case ${to} is ${dest.state?.S}${dest.mergedInto?.S ? ` into ${dest.mergedInto.S}` : ''}; `
+      + 'members move only into open cases');
+  }
+
+  // Expand every argument into members: { member, actionId, instanceId, accountId }.
+  const wanted = new Map();
+  const add = (actionId, instanceId, accountId) => {
+    wanted.set(memberId(actionId, instanceId), { member: memberId(actionId, instanceId), actionId, instanceId, accountId });
+  };
+  for (const spec of specs) {
+    const s = parseMemberSpec(spec);
+    if (s.kind === 'case') {
+      const c = await row(s.caseId);
+      if (!c || c.kind?.S !== 'case') throw new Error(`no incident case ${s.caseId}`);
+      for (const m of Object.values(c.members?.M ?? {})) {
+        add(m.M.actionId.S, m.M.instanceId.S, m.M.accountId?.S ?? 'unknown');
+      }
+      continue;
+    }
+    const a = await row(s.actionId);
+    if (!a || a.kind?.S === 'case') throw new Error(`no isolation run ${s.actionId}`);
+    const targets = targetsOfAction(a);
+    if (s.kind === 'member') {
+      if (!targets[s.instanceId]) throw new Error(`${s.instanceId} is not a target of ${s.actionId}`);
+      add(s.actionId, s.instanceId, targets[s.instanceId]);
+    } else {
+      for (const [instanceId, accountId] of Object.entries(targets)) add(s.actionId, instanceId, accountId);
+    }
+  }
+  if (!wanted.size) throw new Error('nothing to move: the arguments name no members');
+
+  // Where each one is now, grouped by source.
+  const groups = new Map();
+  for (const m of wanted.values()) {
+    const a = await row(m.actionId);
+    const incident = a.incident?.S;
+    const where = locateMember(a, m.instanceId, incident ? await row(incident) : null);
+    if (where.caseId === to) continue;
+    const key = where.caseId ?? '';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push({ ...m, recorded: where.recorded });
+  }
+  if (!groups.size) throw new Error(`nothing to move: every member named is already in ${to}`);
+
+  const done = [];
+  for (const [key, members] of groups) {
+    const from = key || null;
+    if (from) {
+      const src = await row(from);
+      if (src?.state?.S !== 'OPEN') throw new Error(`case ${from} is ${src?.state?.S}; members move only out of open cases`);
+    }
+    const listed = members.map(({ member, accountId, instanceId }) => ({ member, accountId, instanceId }));
+    const data = { from, to, members: listed, comment, ...(via ? { via } : {}) };
+    const written = [];
+    const destRecord = await appendCaseEvent({ caseId: to, event: 'MEMBER_MOVED', actor, data }, creds);
+    written.push({ caseId: to, ...destRecord });
+    if (from) {
+      const srcRecord = await appendCaseEvent({
+        caseId: from, event: 'MEMBER_MOVED', actor,
+        data: { ...data, counterpart: { caseId: to, seq: destRecord.seq, key: destRecord.key } },
+      }, creds);
+      written.push({ caseId: from, ...srcRecord });
+    }
+    for (const actionId of new Set(members.map((m) => m.actionId))) await ensureCasesMap(ddb, actionId);
+    const items = moveTransaction({ table: CASE_TABLE, members, from, to, record: destRecord });
+    await commitOrAbort(ddb, items, written, actor, creds);
+    done.push({ from, to, members: listed.map((m) => m.member), records: written.map(({ caseId, seq }) => ({ caseId, seq })) });
+  }
+  return done;
+}
+
+/** Fold `from` into `into`: move every member, then make `from` an alias of `into`. */
+async function mergeCase({ into, from, comment, actor }, creds) {
+  if (into === from) throw new Error('a case cannot be merged into itself');
+  if (!isCaseId(from)) throw new Error(`'${from}' is not an incident case id`);
+  const ddb = new DynamoDBClient({ region: REGION, credentials: creds });
+  const src = await readCaseRow(ddb, from);
+  if (!src || src.kind?.S !== 'case') throw new Error(`no incident case ${from}`);
+  if (src.state?.S !== 'OPEN') {
+    throw new Error(`case ${from} is ${src.state?.S}${src.mergedInto?.S ? ` into ${src.mergedInto.S}` : ''}; only open cases merge`);
+  }
+  const moves = Object.keys(src.members?.M ?? {}).length
+    ? await moveMembers({ to: into, specs: [from], comment, actor, via: 'merge' }, creds)
+    : [];
+
+  const tickets = src.tickets?.SS ?? [];
+  const written = [];
+  const out = await appendCaseEvent({
+    caseId: from, event: 'MERGED', actor, data: { mergedInto: into, comment },
+  }, creds);
+  written.push({ caseId: from, ...out });
+  const inn = await appendCaseEvent({
+    caseId: into, event: 'MERGED', actor,
+    data: { absorbed: from, tickets, comment, counterpart: { caseId: from, seq: out.seq, key: out.key } },
+  }, creds);
+  written.push({ caseId: into, ...inn });
+  await commitOrAbort(ddb, mergeTransaction({ table: CASE_TABLE, into, from, tickets }), written, actor, creds);
+  return { from, into, tickets, moves, records: written.map(({ caseId, seq }) => ({ caseId, seq })) };
 }
 
 // Which credential path each action needs. Member actions assume

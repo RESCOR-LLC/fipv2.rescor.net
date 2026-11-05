@@ -26,7 +26,9 @@ import { createHash, verify as cryptoVerify } from 'node:crypto';
 export const CASE_SCHEMA = 'fip.case/1';
 export const CASE_ID_PATTERN = /^case-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$/;
 export const ACTION_ID_PATTERN = /^fip-[A-Za-z0-9-]{1,120}$/;
-export const CASE_EVENTS = new Set(['OPENED', 'TICKET_ADDED', 'COMMENT', 'MEMBER_ATTACHED']);
+export const CASE_EVENTS = new Set([
+  'OPENED', 'TICKET_ADDED', 'COMMENT', 'MEMBER_ATTACHED', 'MEMBER_MOVED', 'MERGED', 'ABORTED',
+]);
 export const isActionId = (id) => ACTION_ID_PATTERN.test(String(id ?? ''));
 const INSTANCE_ID_PATTERN = /^i-[0-9a-f]{8,17}$/;
 const ACCOUNT_ID_PATTERN = /^[0-9]{12}$/;
@@ -158,6 +160,207 @@ export function rowUpdateFor(doc, sha256) {
     ExpressionAttributeNames: names,
     ExpressionAttributeValues: values,
   };
+}
+
+/**
+ * ── Moving and merging ───────────────────────────────────────────────
+ * A move changes which case lists a member. Nothing is relocated: the
+ * member's evidence stays under its run's id, and nothing signed is
+ * rewritten. What changes is three kinds of row, in ONE DynamoDB
+ * transaction:
+ *
+ *   - the run's row: `cases.<instance>` names the case that holds it now;
+ *   - the source case's `members` map loses the member;
+ *   - the destination case's `members` map gains it.
+ *
+ * Each is conditioned on what the caller saw, so of two responders moving
+ * the same host at once, one wins and the other is refused. The signed
+ * MEMBER_MOVED records are written to the logs first; if the transaction is
+ * then refused, each orphaned record is followed by a signed ABORTED note
+ * naming it. Readers apply a record unless an ABORTED names it.
+ *
+ * Those rows' membership is therefore changed by the transaction, never by
+ * replaying the record: rowUpdateFor advances only the log head for these
+ * events, so a record that was later aborted cannot be applied by accident.
+ */
+
+/**
+ * What one argument to `fip case move` names:
+ *   fip-…/i-…  one member;  fip-…  every target of that run;  case-…  every member of that case.
+ */
+export function parseMemberSpec(spec) {
+  const s = String(spec ?? '').trim();
+  const slash = s.indexOf('/');
+  if (slash > 0) {
+    const actionId = s.slice(0, slash);
+    const instanceId = s.slice(slash + 1);
+    if (!isActionId(actionId) || !INSTANCE_ID_PATTERN.test(instanceId)) {
+      throw new Error(`'${s}' is not a member (fip-…/i-…)`);
+    }
+    return { kind: 'member', actionId, instanceId };
+  }
+  if (isCaseId(s)) return { kind: 'case', caseId: s };
+  if (isActionId(s)) return { kind: 'action', actionId: s };
+  throw new Error(`'${s}' is not a member (fip-…/i-…), an isolation run (fip-…) or a case (case-…)`);
+}
+
+/** Every target a run's row names, as { instanceId: accountId }. */
+export function targetsOfAction(row) {
+  const out = {};
+  for (const t of row?.requestedTargets?.L ?? []) {
+    const id = t.M?.instanceId?.S;
+    if (id) out[id] = t.M?.accountId?.S ?? 'unknown';
+  }
+  for (const [id, t] of Object.entries(row?.targets?.M ?? {})) {
+    if (!out[id]) out[id] = t.M?.sourceAccount?.S ?? 'unknown';
+  }
+  return out;
+}
+
+/**
+ * The case that holds one member now, or null when it is in none.
+ *
+ * The run's row says so in `cases.<instance>`. Rows written before that map
+ * existed say only which case the run was isolated into (`incident`); for
+ * those, the member is in that case if the case lists it.
+ */
+export function locateMember(actionRow, instanceId, incidentRow = null) {
+  const explicit = actionRow?.cases?.M?.[instanceId]?.S;
+  if (explicit) return { caseId: explicit, recorded: true };
+  const incident = actionRow?.incident?.S;
+  if (incident && incidentRow?.members?.M?.[memberId(actionRow.caseId.S, instanceId)]) {
+    return { caseId: incident, recorded: false };
+  }
+  return { caseId: null, recorded: false };
+}
+
+const memberEntry = (m, { seq, at, key }) => ({
+  M: {
+    actionId: { S: m.actionId },
+    accountId: { S: m.accountId },
+    instanceId: { S: m.instanceId },
+    movedSeq: { N: String(seq) },
+    movedAt: { S: at },
+    movedKey: { S: key },
+  },
+});
+
+/**
+ * The transaction for one move: members, all from ONE source (a case id, or
+ * null for members in no case), to one destination. `record` is the
+ * destination's MEMBER_MOVED record ({ seq, at, key }).
+ *
+ * members: [{ member, actionId, instanceId, accountId, recorded }], where
+ * `recorded` says whether the run's row already names the source in
+ * `cases.<instance>` (see locateMember).
+ */
+export function moveTransaction({ table, members, from, to, record }) {
+  if (!members.length) throw new Error('nothing to move');
+  if (from === to) throw new Error(`the members are already in ${to}`);
+  const items = [];
+
+  // Each run's row: the member is still where the caller saw it.
+  const byAction = new Map();
+  for (const m of members) {
+    if (!byAction.has(m.actionId)) byAction.set(m.actionId, []);
+    byAction.get(m.actionId).push(m);
+  }
+  for (const [actionId, ms] of byAction) {
+    const names = { '#cases': 'cases', '#kind': 'kind' };
+    const values = { ':to': { S: to }, ':action': { S: 'action' } };
+    const set = [];
+    const cond = ['(attribute_not_exists(#kind) OR #kind = :action)'];
+    ms.forEach((m, i) => {
+      names[`#i${i}`] = m.instanceId;
+      set.push(`#cases.#i${i} = :to`);
+      if (m.recorded) {
+        values[':from'] = { S: from };
+        cond.push(`#cases.#i${i} = :from`);
+      } else {
+        cond.push(`attribute_not_exists(#cases.#i${i})`);
+      }
+    });
+    items.push({ Update: {
+      TableName: table, Key: { caseId: { S: actionId } },
+      UpdateExpression: `SET ${set.join(', ')}`,
+      ConditionExpression: cond.join(' AND '),
+      ExpressionAttributeNames: names, ExpressionAttributeValues: values,
+    } });
+  }
+
+  // The source case: open, and still listing every member.
+  if (from) {
+    const names = { '#members': 'members', '#state': 'state' };
+    const remove = [];
+    const cond = ['#state = :open'];
+    members.forEach((m, i) => {
+      names[`#m${i}`] = m.member;
+      remove.push(`#members.#m${i}`);
+      cond.push(`attribute_exists(#members.#m${i})`);
+    });
+    items.push({ Update: {
+      TableName: table, Key: { caseId: { S: from } },
+      UpdateExpression: `REMOVE ${remove.join(', ')}`,
+      ConditionExpression: cond.join(' AND '),
+      ExpressionAttributeNames: names, ExpressionAttributeValues: { ':open': { S: 'OPEN' } },
+    } });
+  }
+
+  // The destination: an open incident case. A CLOSED or MERGED one refuses.
+  const names = { '#members': 'members', '#state': 'state', '#kind': 'kind' };
+  const values = { ':open': { S: 'OPEN' }, ':case': { S: 'case' } };
+  const set = [];
+  members.forEach((m, i) => {
+    names[`#m${i}`] = m.member;
+    values[`:m${i}`] = memberEntry(m, record);
+    set.push(`#members.#m${i} = :m${i}`);
+  });
+  items.push({ Update: {
+    TableName: table, Key: { caseId: { S: to } },
+    UpdateExpression: `SET ${set.join(', ')}`,
+    ConditionExpression: '#kind = :case AND #state = :open',
+    ExpressionAttributeNames: names, ExpressionAttributeValues: values,
+  } });
+  return items;
+}
+
+/**
+ * The transaction that retires `from` into `into` once it has no members
+ * left: `from` becomes MERGED, an alias of `into`, and `into` gains its
+ * tickets and remembers it (release and revoke need every merged case).
+ */
+export function mergeTransaction({ table, into, from, tickets = [] }) {
+  if (into === from) throw new Error('a case cannot be merged into itself');
+  const intoValues = { ':open': { S: 'OPEN' }, ':from': { SS: [from] } };
+  let intoUpdate = 'ADD mergedFrom :from';
+  if (tickets.length) {
+    intoValues[':tickets'] = { SS: [...new Set(tickets)] };
+    intoUpdate += ', tickets :tickets';
+  }
+  return [
+    { Update: {
+      TableName: table, Key: { caseId: { S: from } },
+      UpdateExpression: 'SET #state = :merged, mergedInto = :into',
+      // Empty: every member has been moved, so nothing is left behind in an alias.
+      ConditionExpression: '#state = :open AND (attribute_not_exists(#members) OR size(#members) = :zero)',
+      ExpressionAttributeNames: { '#state': 'state', '#members': 'members' },
+      ExpressionAttributeValues: {
+        ':open': { S: 'OPEN' }, ':merged': { S: 'MERGED' }, ':into': { S: into }, ':zero': { N: '0' },
+      },
+    } },
+    { Update: {
+      TableName: table, Key: { caseId: { S: into } },
+      UpdateExpression: intoUpdate,
+      ConditionExpression: '#state = :open',
+      ExpressionAttributeNames: { '#state': 'state' },
+      ExpressionAttributeValues: intoValues,
+    } },
+  ];
+}
+
+/** Records of a log that a later ABORTED note withdraws, by sequence number. */
+export function abortedSeqs(docs) {
+  return new Set(docs.filter((d) => d?.event === 'ABORTED').map((d) => d.aborts?.seq).filter(Number.isInteger));
 }
 
 /** The signed document inside an envelope, from the signed bytes, not the readable copy. */

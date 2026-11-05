@@ -135,7 +135,7 @@ One executable, `fip`. Every subcommand takes `--help`; §6 is the full referenc
 | `fip restore` | Put a contained instance back on its original security groups | [§6.12](#612-fip-restore) |
 | `fip cleanup` | List what FIP made, or remove what a test made | [§6.13](#613-fip-cleanup) |
 | `fip version` | Which checkout `fip` runs from | [§6.14](#614-fip-version) |
-| `fip case` | Incident cases: tickets, signed comments, and the isolations of one incident. Partly built | [§6.15](#615-fip-case) |
+| `fip case` | Incident cases: tickets, signed comments, the isolations of one incident, moves and merges. Partly built | [§6.15](#615-fip-case) |
 
 ---
 
@@ -341,7 +341,7 @@ Reference: [§6.13](#613-fip-cleanup).
 it with `--case` or `--ticket`. If a case is open when you run it without either, it
 says so and lists the open cases, then proceeds without one. Containment never waits on
 case bookkeeping. A host isolated that way can be moved into the case afterwards with
-`fip case move` once that is built (§5.3).
+`fip case move` (§5.3).
 
 ### 5.2 What a single isolation records
 
@@ -374,9 +374,9 @@ re-running its id with a different `--case` is refused.
 
 ### 5.3 `fip case`
 
-> **Partly built.** `open`, `list`, `show`, `ticket`, `comment` and `fip isolate --case`
-> work now (§6.15, §6.6). `move`, `merge`, `close` and `reopen` are in development, and
-> so are case-wide `status`, `restore`, `release` and `evidence`. The example below
+> **Partly built.** `open`, `list`, `show`, `ticket`, `comment`, `move`, `merge` and
+> `fip isolate --case` work now (§6.15, §6.6). `close` and `reopen` are in development,
+> and so are case-wide `status`, `restore`, `release` and `evidence`. The example below
 > shows the whole design so the workflow can be planned around it.
 
 A **case** is one incident. It holds the isolations made under it (each still a
@@ -391,7 +391,8 @@ CASE=case-20261105T101500Z-3f9a1c                # printed by open
 
 fip isolate --case $CASE 111122223333:i-0abc    # the first host
 fip isolate --case $CASE 444455556666:i-0def    # found an hour later
-fip case move fip-20261105T094000Z-77aa01 --to $CASE   # isolated earlier, before the case
+fip case move fip-20261105T094000Z-77aa01 --to $CASE \
+    --comment "isolated before the case was opened"   # an earlier, standalone run
 fip case show $CASE                              # everything, as a timeline
 fip release --case $CASE --to 333333333333      # every host's evidence at once
 fip case close $CASE --comment "contained; RCA in INC-1234"
@@ -405,8 +406,8 @@ fip case close $CASE --comment "contained; RCA in INC-1234"
 | `fip case ticket <case> T [--comment C]` | Add a ticket. A case may carry several, from different systems | Yes |
 | `fip case comment <case> C` | Add a signed, permanent comment | Yes |
 | `fip isolate --case <case>` | Record an isolation run under the case | Yes |
-| `fip case move <isolation or target>… --to <case> --comment C` | Move a whole isolation (`fip-…`) or one target of it (`fip-…/i-…`) into another case | Next |
-| `fip case merge <into> <from>… --comment C` | Fold whole cases into one. Each `<from>` becomes an alias of `<into>` | Later |
+| `fip case move <isolation or target>… --to <case> --comment C` | Move a whole isolation (`fip-…`), one target of it (`fip-…/i-…`) or every member of a case (`case-…`) into another case | Yes |
+| `fip case merge <into> <from>… --comment C` | Fold whole cases into one. Each `<from>` becomes an alias of `<into>` | Yes |
 | `fip case close <case> --comment C [--force]` | Close. Refused while any host is still contained or any evidence is still shared; `--force` overrides, and is recorded | Later |
 | `fip case reopen <case> --comment C` | Reopen a closed case | Later |
 
@@ -418,6 +419,17 @@ where it was written and nothing signed is rewritten; each move is itself a sign
 record in both cases' logs. A host's containment is never touched. Access already
 released to an analysis account stays with the snapshots, so `fip case show` reports
 release state per host.
+
+**A merged case is an alias.** Any command given its id acts on the case it merged into
+and says so. Its tickets are copied to that case, so `--ticket` finds the survivor.
+There is no unmerge: a mistaken merge is corrected by moving the members back, which
+leaves both moves in the record.
+
+**Two responders at once.** Every move and merge is one database transaction,
+conditioned on what the command read: the member is still where it was, and both cases
+are still open. If someone else changed any of it first, the command is refused and
+changes nothing, and the signed record it had already written is followed by a signed
+`ABORTED` note. `show` marks such a record as withdrawn.
 
 ---
 
@@ -801,6 +813,8 @@ fip case list    [--all] [--ticket T]
 fip case show    <case | --ticket T> [--verify]
 fip case ticket  <case | --ticket T> T [--comment C]
 fip case comment <case | --ticket T> C
+fip case move    <member>… (--to <case> | --ticket T) --comment C
+fip case merge   <into> <from>… --comment C
 ```
 
 Incident cases: when to use one is §5.1, the whole design §5.3. Wherever a case is
@@ -813,6 +827,8 @@ named, `--ticket T` also works if exactly one case carries that ticket.
 | `show` | State, tickets and a timeline of every event, with who did it. Given an isolation run's id (`fip-…`), shows that run instead |
 | `ticket` | Adds a ticket from your own system. Refused if the case already carries it, or is not open |
 | `comment` | Adds a comment. It is signed and permanent, so write it as you would a note in a case file |
+| `move` | Moves members into an open case. A member is `fip-…/i-…`; `fip-…` names every target of that run, and `case-…` every member of that case. One `MEMBER_MOVED` record goes in each case's log; members in no case have only the destination's. `--comment` is required |
+| `merge` | Moves every member of each `<from>` into `<into>`, then makes each `<from>` an alias (`MERGED` in both logs). Tickets may be given in place of case ids. `--comment` is required |
 
 **Isolating into a case.** `fip isolate --case C` (or `--ticket T`) records the run's
 targets in the case as it starts, before any host is touched. Each target becomes a

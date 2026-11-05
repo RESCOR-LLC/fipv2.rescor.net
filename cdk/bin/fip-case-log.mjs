@@ -8,14 +8,16 @@
  * Reads every *.json in the directory, checks each record's signature and the
  * chain (lambda/member-action/case-log.mjs), and with a key file also checks
  * that this installation signed each one. Prints
- *   { ok, problems: [...], records: [{ seq, event, at, actor, ...fields }] }
+ *   { ok, problems: [...], records: [{ seq, event, at, actor, ...fields, aborted }] }
+ * `aborted` is true for a record a later ABORTED note withdraws: it is part of
+ * the log, and what it describes did not happen.
  */
 import { readFileSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const { verifyCaseLog, caseLogKey } = await import(join(here, '..', 'lambda', 'member-action', 'case-log.mjs'));
+const { verifyCaseLog, caseLogKey, abortedSeqs } = await import(join(here, '..', 'lambda', 'member-action', 'case-log.mjs'));
 
 const [caseId, dir, keyFile] = process.argv.slice(2);
 if (!caseId || !dir) {
@@ -34,8 +36,11 @@ const records = files.map((f) => {
 });
 
 const result = verifyCaseLog(caseId, records, keyFile ? readFileSync(keyFile) : null);
+const withdrawn = abortedSeqs(result.records.map((r) => r.doc));
 process.stdout.write(JSON.stringify({
   ok: result.ok,
   problems: result.problems,
-  records: result.records.map((r) => ({ ...(r.doc ?? {}), key: r.key, problems: r.problems })),
+  records: result.records.map((r) => ({
+    ...(r.doc ?? {}), key: r.key, problems: r.problems, aborted: withdrawn.has(r.doc?.seq),
+  })),
 }, null, 2) + '\n');
