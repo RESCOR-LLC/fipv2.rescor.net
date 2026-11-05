@@ -41,6 +41,7 @@ import {
   isCaseId, caseLogKey, sha256Hex, checkTicket, checkComment, buildCaseEvent,
   rowUpdateFor, signedDocument, summarizeAction, attachedMembers,
   parseMemberSpec, targetsOfAction, locateMember, memberId, moveTransaction, mergeTransaction,
+  REQUIRED_STATE, shareState, custodyOf, closeBlockers,
 } from './case-log.mjs';
 
 const REGION = process.env.AWS_REGION;
@@ -1031,6 +1032,8 @@ async function caseOpen(event, creds) {
  * that is invisible in the snapshot's permissions and looks like nothing.
  */
 async function releaseToAnalysis(event, creds) {
+  // An incident case: every member's evidence, under one grant for the case.
+  if (isCaseId(event.caseId)) return releaseCase(event, creds);
   const { caseId, copies = [], analysisAccountId, revoke = false, actor = null } = event;
 
   const target = analysisAccountId || ANALYSIS_ACCOUNT;
@@ -1238,7 +1241,6 @@ async function readCaseRow(ddb, caseId) {
   return Item ?? null;
 }
 
-const MEMBERSHIP_EVENTS = new Set(['MEMBER_ATTACHED', 'MEMBER_MOVED', 'MERGED']);
 
 /** A run's row gains its `cases` map if it predates it. A nested SET needs the parent. */
 async function ensureCasesMap(ddb, actionId) {
@@ -1276,10 +1278,12 @@ async function appendCaseEvent({ caseId, event, data, actor }, creds) {
     const row = await readCaseRow(ddb, caseId);
     if (!row || row.kind?.S !== 'case') throw new Error(`no incident case ${caseId}`);
     // Re-checked on every attempt, so a case closed or merged between the
-    // caller's own check and this write does not gain or lose a member.
-    if (MEMBERSHIP_EVENTS.has(event) && row.state?.S !== 'OPEN') {
+    // caller's own check and this write does not gain or lose a member, and
+    // is not released or closed twice.
+    const required = REQUIRED_STATE[event];
+    if (required && row.state?.S !== required) {
       throw new Error(`case ${caseId} is ${row.state?.S}${row.mergedInto?.S ? ` into ${row.mergedInto.S}` : ''}; `
-        + 'membership changes only in open cases');
+        + `${event} needs it ${required}`);
     }
     const last = Number(row.logSeq?.N ?? 0);
     const seq = last + 1;
@@ -1361,6 +1365,14 @@ async function caseAction(event, creds) {
     return { op, record };
   }
 
+  if (op === 'members') {
+    return { op, ...(await caseMembers(caseId, { containment: event.containment === true }, creds)) };
+  }
+
+  if (op === 'close' || op === 'reopen') {
+    return { op, ...(await closeOrReopen({ caseId, op, comment: event.comment, force: event.force === true, actor }, creds)) };
+  }
+
   if (op === 'move') {
     const comment = checkComment(event.comment, { required: true });
     const moves = await moveMembers({ to: caseId, specs: event.members ?? [], comment, actor }, creds);
@@ -1377,7 +1389,243 @@ async function caseAction(event, creds) {
     return { op, into: caseId, merged };
   }
 
-  throw new Error(`unknown case operation '${op}' (have: open, ticket, comment, move, merge)`);
+  throw new Error(`unknown case operation '${op}' (have: open, ticket, comment, members, move, merge, close, reopen)`);
+}
+
+/**
+ * Every member of a case, with where its acquisition stands, its evidence
+ * copies, and which analysis accounts can open them. With `containment`,
+ * also whether its host is still contained, asked of the member account
+ * through the restore planner, which changes nothing.
+ */
+async function caseMembers(caseId, { containment = false } = {}, creds) {
+  const ddb = new DynamoDBClient({ region: REGION, credentials: creds });
+  const row = await readCaseRow(ddb, caseId);
+  if (!row || row.kind?.S !== 'case') throw new Error(`no incident case ${caseId}`);
+  const runs = new Map();
+  const members = [];
+  for (const [member, v] of Object.entries(row.members?.M ?? {}).sort(([a], [b]) => a.localeCompare(b))) {
+    const actionId = v.M.actionId.S;
+    const instanceId = v.M.instanceId.S;
+    if (!runs.has(actionId)) runs.set(actionId, await readCaseRow(ddb, actionId));
+    const run = runs.get(actionId);
+    const target = run?.targets?.M?.[instanceId]?.M;
+    const failed = (run?.failures?.L ?? []).some((f) => f.M?.instanceId?.S === instanceId);
+    const m = {
+      member, actionId, instanceId,
+      accountId: v.M.accountId?.S ?? target?.sourceAccount?.S ?? 'unknown',
+      acquisition: target?.state?.S ?? (failed ? 'FAILED' : (run?.state?.S === 'IN_PROGRESS' ? 'IN_PROGRESS' : 'NOT_RECORDED')),
+      manifestKey: target?.manifestKey?.S ?? null,
+      evidenceSnapshots: (target?.evidenceSnapshots?.SS ?? []).filter((s) => s !== 'none'),
+      sharedTo: shareState(custodyOf(run), [instanceId])[instanceId],
+    };
+    if (containment) {
+      try {
+        const plan = await restoreInstance({ instanceId }, await memberCredentials(m.accountId, actionId));
+        m.contained = plan.plan.some((p) => p.status === 'RESTORE' || p.status === 'BLOCKED');
+      } catch (err) {
+        if (/not found|InvalidInstanceID/i.test(`${err.name} ${err.message}`)) {
+          m.contained = false;
+          m.containmentNote = 'instance no longer exists';
+        } else {
+          m.contained = null;
+          m.containmentError = String(err.message ?? err).slice(0, 300);
+        }
+      }
+    }
+    members.push(m);
+  }
+  return {
+    caseId,
+    state: row.state?.S ?? null,
+    tickets: row.tickets?.SS ?? [],
+    mergedFrom: row.mergedFrom?.SS ?? [],
+    mergedInto: row.mergedInto?.S ?? null,
+    members,
+  };
+}
+
+/** The KMS grant names a case's releases may have used: its own and every case merged into it. */
+async function grantNamesFor(ddb, caseId) {
+  const names = new Set();
+  const queue = [caseId];
+  while (queue.length && names.size < 200) {
+    const id = queue.shift();
+    if (names.has(`fip-${id}`)) continue;
+    names.add(`fip-${id}`);
+    const r = await readCaseRow(ddb, id);
+    for (const from of r?.mergedFrom?.SS ?? []) queue.push(from);
+  }
+  return [...names];
+}
+
+/**
+ * Release a whole case's evidence to an analysis account, or withdraw it.
+ * The copies come from the members, read here rather than from the caller,
+ * so a release cannot cover a host the case does not hold.
+ *
+ * One KMS grant per case, named fip-<case>. A revoke retires that grant and
+ * those of every case merged into this one, and removes the share from every
+ * member's copies, whichever release added it.
+ */
+async function releaseCase(event, creds) {
+  const { caseId, analysisAccountId, revoke = false, actor = null, dryRun = false } = event;
+  const target = String(analysisAccountId ?? '');
+  if (!/^[0-9]{12}$/.test(target)) throw new Error(`analysis account '${target}' is not a 12-digit account id`);
+  const ddb = new DynamoDBClient({ region: REGION, credentials: creds });
+
+  const view = await caseMembers(caseId, {}, creds);
+  if (view.state === 'MERGED') throw new Error(`case ${caseId} is merged into ${view.mergedInto}; act on that case`);
+  if (!revoke && view.state !== 'OPEN') throw new Error(`case ${caseId} is ${view.state}; evidence is released only from open cases`);
+  const members = view.members.filter((m) => m.evidenceSnapshots.length);
+  const copies = [...new Set(members.flatMap((m) => m.evidenceSnapshots))];
+  if (!copies.length) throw new Error(`case ${caseId} has no evidence copies to ${revoke ? 'revoke' : 'release'} yet`);
+  const grantNames = revoke ? await grantNamesFor(ddb, caseId) : [`fip-${caseId}`];
+  const plan = {
+    caseId, event: revoke ? 'REVOKED_FROM_ANALYSIS' : 'RELEASED_TO_ANALYSIS', analysisAccountId: target,
+    members: members.map(({ member, sharedTo, evidenceSnapshots }) => ({ member, sharedTo, snapshots: evidenceSnapshots })),
+    withoutEvidence: view.members.filter((m) => !m.evidenceSnapshots.length).map((m) => `${m.member} (${m.acquisition})`),
+    snapshots: copies, grantNames,
+  };
+  if (dryRun) return { ...plan, dryRun: true };
+
+  const ec2 = ec2For(creds);
+  const kms = new KMSClient({ region: REGION, credentials: creds });
+  for (const snapshotId of copies) {
+    await ec2.send(new ModifySnapshotAttributeCommand({
+      SnapshotId: snapshotId, Attribute: 'createVolumePermission',
+      OperationType: revoke ? 'remove' : 'add', UserIds: [target],
+    }));
+  }
+  const grants = [];
+  if (revoke) {
+    let marker;
+    do {
+      const listed = await kms.send(new ListGrantsCommand({
+        KeyId: EVIDENCE_KEY_ALIAS, GranteePrincipal: `arn:aws:iam::${target}:root`, Marker: marker,
+      }));
+      for (const g of listed.Grants ?? []) {
+        if (!grantNames.includes(g.Name)) continue;
+        await kms.send(new RetireGrantCommand({ KeyId: EVIDENCE_KEY_ALIAS, GrantId: g.GrantId }));
+        grants.push(g.GrantId);
+      }
+      marker = listed.Truncated ? listed.NextMarker : undefined;
+    } while (marker);
+  } else {
+    const g = await kms.send(new CreateGrantCommand({
+      KeyId: EVIDENCE_KEY_ALIAS, GranteePrincipal: `arn:aws:iam::${target}:root`,
+      Name: `fip-${caseId}`, Operations: ['Decrypt', 'DescribeKey'],
+    }));
+    grants.push(g.GrantId);
+  }
+
+  const custody = {
+    schema: 'fip.custody/1',
+    caseId,
+    event: plan.event,
+    at: new Date().toISOString(),
+    analysisAccountId: target,
+    evidenceAccountId: EVIDENCE_ACCOUNT,
+    members: plan.members.map((m) => m.member),
+    snapshots: copies,
+    kmsGrantIds: grants,
+    kmsGrantNames: grantNames,
+    actor,
+    note: revoke
+      ? 'Snapshot shares removed from every member\'s evidence and the case\'s KMS grants retired. Existing volumes already created from these snapshots are NOT destroyed by this.'
+      : 'Analysis account may create volumes from these snapshots and decrypt them. It cannot delete them, cannot re-encrypt under the forensic key, and cannot widen its own access.',
+  };
+  const envelope = await signEnvelope('custody', custody, 'custody.json');
+  const key = `cases/${caseId}/custody/${custody.at.replace(/[:.]/g, '-')}-${revoke ? 'revoke' : 'release'}.json`;
+  const s3 = new S3Client({ region: REGION, credentials: creds });
+  await s3.send(new PutObjectCommand({
+    Bucket: EVIDENCE_BUCKET, Key: key, Body: JSON.stringify(envelope, null, 2),
+    ContentType: 'application/json', ...objectLock(),
+  }));
+
+  // On each run's row too, naming the instances: share state is per member,
+  // and it follows the member into whatever case holds it later.
+  const byRun = new Map();
+  for (const m of members) {
+    const a = view.members.find((x) => x.member === m.member);
+    if (!byRun.has(a.actionId)) byRun.set(a.actionId, []);
+    byRun.get(a.actionId).push(a.instanceId);
+  }
+  for (const [actionId, instances] of byRun) {
+    await ddb.send(new UpdateItemCommand({
+      TableName: CASE_TABLE, Key: { caseId: { S: actionId } },
+      UpdateExpression: 'SET custody = list_append(if_not_exists(custody, :empty), :entry)',
+      ExpressionAttributeValues: {
+        ':empty': { L: [] },
+        ':entry': { L: [{ M: {
+          event: { S: custody.event }, at: { S: custody.at }, analysisAccountId: { S: target },
+          recordKey: { S: key }, snapshotCount: { N: String(copies.length) },
+          instances: { SS: instances }, incident: { S: caseId },
+        } }] },
+      },
+    }));
+  }
+
+  const record = await appendCaseEvent({
+    caseId, event: revoke ? 'REVOKED' : 'RELEASED', actor,
+    data: { analysisAccountId: target, members: custody.members, snapshots: copies, kmsGrantNames: grantNames, custodyKey: key },
+  }, creds);
+  return {
+    caseId, event: custody.event, analysisAccountId: target, members: custody.members,
+    snapshots: copies, kmsGrantIds: grants, kmsGrantNames: grantNames, custodyRecordKey: key,
+    record, withoutEvidence: plan.withoutEvidence,
+  };
+}
+
+/**
+ * Close a case, or reopen it. Closing deletes nothing; it says the incident
+ * is over. It is refused while any member's host is still contained or any
+ * of its evidence is still shared, unless forced, and a forced close records
+ * exactly what it overrode.
+ */
+async function closeOrReopen({ caseId, op, comment, force = false, actor }, creds) {
+  const text = checkComment(comment, { required: true });
+  const ddb = new DynamoDBClient({ region: REGION, credentials: creds });
+  if (op === 'reopen') {
+    const row = await readCaseRow(ddb, caseId);
+    if (!row || row.kind?.S !== 'case') throw new Error(`no incident case ${caseId}`);
+    const rec = await appendCaseEvent({ caseId, event: 'REOPENED', actor, data: { comment: text } }, creds);
+    await commitOrAbort(ddb, [{ Update: {
+      TableName: CASE_TABLE, Key: { caseId: { S: caseId } },
+      UpdateExpression: 'SET #state = :open REMOVE closedAt, closedBy',
+      ConditionExpression: '#state = :closed',
+      ExpressionAttributeNames: { '#state': 'state' },
+      ExpressionAttributeValues: { ':open': { S: 'OPEN' }, ':closed': { S: 'CLOSED' } },
+    } }], [{ caseId, ...rec }], actor, creds);
+    return { caseId, state: 'OPEN', record: rec };
+  }
+
+  const view = await caseMembers(caseId, { containment: true }, creds);
+  if (view.state !== 'OPEN') throw new Error(`case ${caseId} is ${view.state}; only open cases close`);
+  const blockers = closeBlockers(view.members);
+  if (blockers.length && !force) {
+    const err = new Error(`case ${caseId} cannot close yet: ${blockers.join('; ')}. `
+      + 'Restore and revoke first, or close with --force, which records what it overrode.');
+    throw err;
+  }
+  const rec = await appendCaseEvent({
+    caseId, event: 'CLOSED', actor,
+    data: { comment: text, forced: blockers.length > 0, overridden: blockers, memberCount: view.members.length },
+  }, creds);
+  const at = new Date().toISOString();
+  await commitOrAbort(ddb, [{ Update: {
+    TableName: CASE_TABLE, Key: { caseId: { S: caseId } },
+    UpdateExpression: 'SET #state = :closed, closedAt = :at, closedBy = :by',
+    // The members checked are the members closed: a host attached since the
+    // check refuses the close rather than slipping in unchecked.
+    ConditionExpression: '#state = :open AND size(#members) = :n',
+    ExpressionAttributeNames: { '#state': 'state', '#members': 'members' },
+    ExpressionAttributeValues: {
+      ':open': { S: 'OPEN' }, ':closed': { S: 'CLOSED' }, ':at': { S: at },
+      ':by': { S: actor ?? 'unknown' }, ':n': { N: String(view.members.length) },
+    },
+  } }], [{ caseId, ...rec }], actor, creds);
+  return { caseId, state: 'CLOSED', forced: blockers.length > 0, overridden: blockers, record: rec, members: view.members };
 }
 
 /** Why a transaction was refused, in words: which row's condition failed. */

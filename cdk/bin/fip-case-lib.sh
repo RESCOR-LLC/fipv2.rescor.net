@@ -89,3 +89,49 @@ open_cases() {
       | .[] | [.caseId.S, ((.openedAt.S // "?")[0:16]),
                ((.tickets.SS // []) | if length > 0 then join(",") else "-" end)] | @tsv'
 }
+
+# A case's members, as the fip-member-action Lambda sees them: acquisition,
+# evidence copies, and which analysis accounts can open them. With $2 = true,
+# also whether each host is still contained (asked of its account; read-only).
+# Runs as the orchestrator: ORCHESTRATOR_PROFILE if the caller set it, else
+# the ambient credentials. Prints the Lambda's JSON.
+case_members() {  # $1 = case id, $2 = true|false
+    local out payload
+    out="$(mktemp)"
+    payload="$(jq -cn --arg c "$1" --argjson k "${2:-false}" \
+        '{action: "case", op: "members", caseId: $c, containment: $k}')"
+    aws ${ORCHESTRATOR_PROFILE:+--profile "$ORCHESTRATOR_PROFILE"} --region "${REGION:-us-east-1}" \
+        lambda invoke --function-name fip-member-action --cli-read-timeout 600 \
+        --payload "$(printf '%s' "$payload" | base64 | tr -d '\n')" "$out" >/dev/null
+    if jq -e 'has("errorMessage")' "$out" >/dev/null 2>&1; then
+        echo "ERROR: $(jq -r .errorMessage "$out")" >&2
+        rm -f "$out"
+        exit 1
+    fi
+    cat "$out"
+    rm -f "$out"
+}
+
+# The members table, from case_members output on stdin.
+print_members() {
+    jq -r '
+      (["MEMBER", "ACCOUNT", "ACQUISITION", "CONTAINED", "SHARED TO"] | @tsv),
+      (.members[] | [.member, .accountId, .acquisition,
+        (if .contained == true then "yes" elif .contained == false then (if .containmentNote then "no (gone)" else "no" end)
+         elif has("contained") then "unknown" else "-" end),
+        (if (.sharedTo | length) > 0 then .sharedTo | join(",") else "-" end)] | @tsv)
+    ' | column -t -s $'\t'
+}
+
+# For commands that run as the orchestrator: the evidence profile `fip
+# configure` saved, to read the case table as fip case does. Defines
+# `evidence` unless the caller already has.
+use_saved_evidence_profile() {  # $1 = region
+    local config="${FIP_CONFIG:-$HOME/.fip/install.env}" p=""
+    [ -f "$config" ] && p="$(sed -n 's/^export FIP_EVIDENCE_PROFILE=//p' "$config" | tail -1)"
+    FIP_CASE_EVIDENCE_PROFILE="${p:-fip-evidence}"
+    FIP_CASE_REGION="$1"
+    declare -F evidence >/dev/null || evidence() {
+        aws --profile "$FIP_CASE_EVIDENCE_PROFILE" --region "$FIP_CASE_REGION" "$@"
+    }
+}

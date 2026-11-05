@@ -135,7 +135,7 @@ One executable, `fip`. Every subcommand takes `--help`; §6 is the full referenc
 | `fip restore` | Put a contained instance back on its original security groups | [§6.12](#612-fip-restore) |
 | `fip cleanup` | List what FIP made, or remove what a test made | [§6.13](#613-fip-cleanup) |
 | `fip version` | Which checkout `fip` runs from | [§6.14](#614-fip-version) |
-| `fip case` | Incident cases: tickets, signed comments, the isolations of one incident, moves and merges. Partly built | [§6.15](#615-fip-case) |
+| `fip case` | Incident cases: tickets, signed comments, the isolations of one incident, moves, merges, close and reopen | [§6.15](#615-fip-case) |
 
 ---
 
@@ -374,10 +374,8 @@ re-running its id with a different `--case` is refused.
 
 ### 5.3 `fip case`
 
-> **Partly built.** `open`, `list`, `show`, `ticket`, `comment`, `move`, `merge` and
-> `fip isolate --case` work now (§6.15, §6.6). `close` and `reopen` are in development,
-> and so are case-wide `status`, `restore`, `release` and `evidence`. The example below
-> shows the whole design so the workflow can be planned around it.
+Every command below works (§6.15, §6.6), and `status`, `restore`, `release` and
+`evidence` accept a case (§6.7, §6.8, §6.11, §6.12).
 
 A **case** is one incident. It holds the isolations made under it (each still a
 `fip isolate` run, with its own id and records, unchanged), tickets from your own
@@ -408,8 +406,8 @@ fip case close $CASE --comment "contained; RCA in INC-1234"
 | `fip isolate --case <case>` | Record an isolation run under the case | Yes |
 | `fip case move <isolation or target>… --to <case> --comment C` | Move a whole isolation (`fip-…`), one target of it (`fip-…/i-…`) or every member of a case (`case-…`) into another case | Yes |
 | `fip case merge <into> <from>… --comment C` | Fold whole cases into one. Each `<from>` becomes an alias of `<into>` | Yes |
-| `fip case close <case> --comment C [--force]` | Close. Refused while any host is still contained or any evidence is still shared; `--force` overrides, and is recorded | Later |
-| `fip case reopen <case> --comment C` | Reopen a closed case | Later |
+| `fip case close <case> --comment C [--force]` | Close. Refused while any host is still contained or any evidence is still shared; `--force` overrides, and is recorded | Yes |
+| `fip case reopen <case> --comment C` | Reopen a closed case | Yes |
 
 Wherever a case id is accepted, `--ticket T` also works if exactly one case carries
 that ticket; if several do, the command lists them and refuses to guess.
@@ -633,8 +631,19 @@ Ctrl-C stops `--watch`, not the case. By hand:
 ### 6.7 `fip status`
 
 ```
-fip status <case-id> [--watch] [--interval N]
+fip status <run-id> [--watch] [--interval N]
+fip status <case-id | --ticket T> [--watch]
 ```
+
+**Given an incident case** (`case-…`), it lists every member: its account, how its
+acquisition stands, whether its host is **still contained** (asked of the member
+account through the restore planner, which changes nothing), and which analysis
+accounts its evidence is **shared to**. Release state is per member: it follows the
+evidence into whatever case holds it now, so a merged case can show some members
+shared and some not. `--watch` refreshes while any member is still acquiring; for a
+run's copy progress, `fip status <run id>`.
+
+**Given an isolation run** (`fip-…`):
 
 Prints the run's state (§5.2), each target's state, the custody events, and the
 progress of the evidence copies: size, percent complete, throughput, ETA. `--watch`
@@ -651,8 +660,14 @@ follows the copy and is not in it. By hand: [Appendix B.4](#b4-watch-a-case-by-h
 ### 6.8 `fip evidence`
 
 ```
-fip evidence <case-id> [--out DIR]
+fip evidence <run-id | case-id | --ticket T> [--out DIR]
 ```
+
+**Given an incident case**, it downloads the case's log and custody records into
+`case/`, and each member's manifest and its run's custody records into
+`members/<run>/`, and verifies every one. It also checks the case log as a **chain**:
+a record deleted, reordered or replaced fails even when each remaining record verifies
+on its own.
 
 Downloads the case's manifests and custody records into `./<case-id>`, or `--out DIR`,
 and verifies each as `fip verify --ours` does. Changes nothing in AWS.
@@ -703,8 +718,18 @@ substitute both. They run `fip verify <file> --public-key fip-signing-key.pem`.
 ### 6.11 `fip release`
 
 ```
-fip release --case <case-id> --to <account> [--revoke] [--dry-run] [--yes]
+fip release (--case <run-id | case-id> | --ticket T) --to <account> [--revoke] [--dry-run] [--yes]
 ```
+
+**Given an incident case**, it releases every member's evidence copies, read from the
+members by the Lambda rather than from the command line, under **one KMS grant per
+case**, named `fip-<case-id>`. It shows the plan first: each member, its snapshots,
+and who they are shared to now. A member still acquiring has no copies yet and is
+listed as not covered. A revoke removes the share from every member's copies and
+retires the grants of the case **and of every case merged into it**. Each release or
+revoke is a signed custody record under the case, an entry on each member's run, and a
+`RELEASED` or `REVOKED` record in the case log. A closed case releases nothing; reopen
+it first. A revoke is always allowed.
 
 Gives an analysis account (§10) access to a case's evidence: a share of each evidence
 snapshot, and a KMS grant on the forensic key. It needs both: a shared encrypted
@@ -729,7 +754,13 @@ the case row.
 
 ```
 fip restore <account>:<instance> [--dry-run] [--yes]
+fip restore (--case C | --ticket T) [<member>…] [--dry-run] [--yes]
 ```
+
+**Given an incident case**, it asks each member account which hosts are still
+contained, then restores those, or only the members named (`fip-…/i-…` or `i-…`). Every
+plan is shown first and one confirmation covers them all. Each host is then restored
+exactly as below, with its own signed custody record.
 
 Puts a contained instance back on the security groups it had, taken from the case's
 signed manifest. **It reconnects the instance**: if it is still compromised, it can
@@ -815,6 +846,8 @@ fip case ticket  <case | --ticket T> T [--comment C]
 fip case comment <case | --ticket T> C
 fip case move    <member>… (--to <case> | --ticket T) --comment C
 fip case merge   <into> <from>… --comment C
+fip case close   <case | --ticket T> --comment C [--force]
+fip case reopen  <case | --ticket T> --comment C
 ```
 
 Incident cases: when to use one is §5.1, the whole design §5.3. Wherever a case is
@@ -829,6 +862,8 @@ named, `--ticket T` also works if exactly one case carries that ticket.
 | `comment` | Adds a comment. It is signed and permanent, so write it as you would a note in a case file |
 | `move` | Moves members into an open case. A member is `fip-…/i-…`; `fip-…` names every target of that run, and `case-…` every member of that case. One `MEMBER_MOVED` record goes in each case's log; members in no case have only the destination's. `--comment` is required |
 | `merge` | Moves every member of each `<from>` into `<into>`, then makes each `<from>` an alias (`MERGED` in both logs). Tickets may be given in place of case ids. `--comment` is required |
+| `close` | Closes the incident. It first asks every member account whether each host is still contained, and reads each member's share state. **Refused** while any host is contained, any evidence is shared, or any host could not be checked. `--force` overrides, and the `CLOSED` record lists exactly what it overrode. Closing deletes nothing: retention (§8) still decides how long evidence is kept. A closed case takes no new members, moves or releases; a revoke still works |
+| `reopen` | Opens a closed case again. `--comment` is required |
 
 **Isolating into a case.** `fip isolate --case C` (or `--ticket T`) records the run's
 targets in the case as it starts, before any host is touched. Each target becomes a

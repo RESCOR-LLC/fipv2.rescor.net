@@ -28,7 +28,69 @@ export const CASE_ID_PATTERN = /^case-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$/;
 export const ACTION_ID_PATTERN = /^fip-[A-Za-z0-9-]{1,120}$/;
 export const CASE_EVENTS = new Set([
   'OPENED', 'TICKET_ADDED', 'COMMENT', 'MEMBER_ATTACHED', 'MEMBER_MOVED', 'MERGED', 'ABORTED',
+  'RELEASED', 'REVOKED', 'CLOSED', 'REOPENED',
 ]);
+
+/** The state a case must be in for each event that needs one. */
+export const REQUIRED_STATE = {
+  MEMBER_ATTACHED: 'OPEN', MEMBER_MOVED: 'OPEN', MERGED: 'OPEN', RELEASED: 'OPEN',
+  CLOSED: 'OPEN', REOPENED: 'CLOSED',
+};
+
+/**
+ * Which analysis accounts can create volumes from each target's evidence,
+ * from a run row's custody entries, replayed in order. A share is per
+ * snapshot, so a revoke removes the account whichever release added it.
+ * Entries made before cases existed name no instances: they covered every
+ * target of the run.
+ *
+ * Returns { instanceId: [accountId, ...] } for the instances asked about.
+ */
+export function shareState(custody = [], instanceIds = []) {
+  const shared = new Map(instanceIds.map((i) => [i, new Set()]));
+  for (const e of custody) {
+    const event = e?.event;
+    const account = e?.analysisAccountId;
+    if (!account || (event !== 'RELEASED_TO_ANALYSIS' && event !== 'REVOKED_FROM_ANALYSIS')) continue;
+    const covers = Array.isArray(e.instances) && e.instances.length ? e.instances : instanceIds;
+    for (const i of covers) {
+      if (!shared.has(i)) continue;
+      if (event === 'RELEASED_TO_ANALYSIS') shared.get(i).add(account);
+      else shared.get(i).delete(account);
+    }
+  }
+  return Object.fromEntries([...shared].map(([i, s]) => [i, [...s].sort()]));
+}
+
+/** A run row's custody list, as plain objects. */
+export function custodyOf(row) {
+  return (row?.custody?.L ?? []).map((e) => ({
+    event: e.M?.event?.S,
+    at: e.M?.at?.S,
+    analysisAccountId: e.M?.analysisAccountId?.S,
+    instances: e.M?.instances?.SS ?? null,
+    recordKey: e.M?.recordKey?.S,
+  }));
+}
+
+/**
+ * Whether a case may close, from its members' state. Contained: an
+ * interface is not on its original groups (the restore planner's RESTORE or
+ * BLOCKED). Shared: any analysis account can still create volumes. A member
+ * whose state could not be read blocks too: closing on a guess is not a
+ * close.
+ */
+export function closeBlockers(members = []) {
+  const out = [];
+  for (const m of members) {
+    if (m.contained === true) out.push(`${m.member} is still contained`);
+    if (m.contained === null || m.contained === undefined) {
+      out.push(`${m.member}: containment could not be checked (${m.containmentError ?? 'unknown'})`);
+    }
+    if ((m.sharedTo ?? []).length) out.push(`${m.member} is shared to ${m.sharedTo.join(', ')}`);
+  }
+  return out;
+}
 export const isActionId = (id) => ACTION_ID_PATTERN.test(String(id ?? ''));
 const INSTANCE_ID_PATTERN = /^i-[0-9a-f]{8,17}$/;
 const ACCOUNT_ID_PATTERN = /^[0-9]{12}$/;
