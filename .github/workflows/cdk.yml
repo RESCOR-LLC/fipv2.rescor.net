@@ -1,0 +1,79 @@
+# CI for the FIP v2 CDK app: unit tests, cdk-nag, and synth.
+name: CDK
+
+# Every change lands via PR, so an unscoped push trigger ran this twice on the
+# same sha — once for the push, once for the PR. Scoping push to main keeps the
+# run on the merge commit, which is the tree neither parent was tested on, and
+# drops the duplicate. The narrowing: a branch with no open PR now gets no CI.
+on:
+  push:
+    branches: [main]
+    paths: ['cdk/**', '.github/workflows/cdk.yml']
+  pull_request:
+    paths: ['cdk/**', '.github/workflows/cdk.yml']
+
+# head_ref is set only for pull_request and ref_name only for push, so both
+# events on one branch resolve to the same key. github.ref would NOT collapse
+# them: it is refs/heads/<branch> for push but refs/pull/<n>/merge for the PR.
+#
+# Cancel only on PRs. Canceling a run on main would leave that commit with no
+# verdict, and main is unprotected, so nothing else would notice the gap.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    working-directory: cdk
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      # Synth needs account IDs. These are placeholders: no stack embeds
+      # them in a committed artifact, and CI never holds credentials or
+      # deploys. Real IDs come from bin/discover-accounts.sh at deploy time.
+      FIP_EVIDENCE_ACCOUNT_ID: '111111111111'
+      FIP_ORCHESTRATOR_ACCOUNT_ID: '222222222222'
+      # Set so the OPT-IN analysis stack is actually synthesized and nagged.
+      # It is only instantiated when this is present, so without it the stack
+      # would be the one part of FIP that CI never looks at — which is exactly
+      # backwards for the piece examiners connect to.
+      FIP_ANALYSIS_ACCOUNT_ID: '333333333333'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci
+
+      # The design decisions, asserted.
+      - name: Unit tests
+        run: npm test
+
+      - name: Synthesize
+        run: npx cdk synth --quiet
+
+      # Fails the build on any unsuppressed finding. Suppressions live in
+      # bin/fip-app.js and each carries its evidence.
+      #
+      # --output is REQUIRED. Enabling cdk-nag bakes cdk_nag suppression
+      # metadata into the synthesized template, so running it into the default
+      # cdk.out clobbers the clean artifact the next step compares against, and
+      # the diff fails on metadata that never ships. Keep the two outputs apart.
+      - name: cdk-nag
+        run: npx cdk synth --context fip:nag=true --quiet --output cdk.out.nag
+
+      # This check also requires versionReporting:false in cdk.json. CDK's
+      # CDKMetadata resource carries an Analytics blob that embeds the
+      # synthesizing machine's Node version, so the committed template could
+      # never be byte-stable between a developer's laptop and this runner.
+      # Dropping it is right on the merits anyway: that resource exists only to
+      # report construct usage to AWS, and this template deploys into customer
+      # member accounts.
+      #
+      # The committed member template must match what a CLEAN synth produces —
+      # no nag metadata. It is the artifact an operator deploys by hand or via
+      # StackSet, so it should contain nothing that only exists for CI.
+      - name: Committed synth output is current
+        run: diff -u synth/FipMemberStack.template.json cdk.out/FipMemberStack.template.json

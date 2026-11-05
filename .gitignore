@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+~$*.docx
+.DS_Store
+virtual/
+.venv/
+node_modules/
+cdk.out/
+cdk.out*/
+
+# CDK's context cache. The usual advice is to COMMIT this so synth is
+# reproducible, and for FIP the opposite is right: no stack may require a
+# context lookup. FipMemberStack and FipAnalysisStack are deliberately
+# account-agnostic so they synthesize with no credentials in the target
+# account — a member account or a third-party examiner's tenant. A tracked
+# context file would start empty, silently fill with account-specific
+# lookups the first time someone synthesized with credentials, and then be
+# committed as though it were part of the design.
+cdk.context.json

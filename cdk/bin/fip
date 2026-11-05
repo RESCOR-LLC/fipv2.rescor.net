@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+#
+# fip — the Forensic Isolation Program command line.
+#
+#   fip isolate 111122223333:i-0abc 444455556666:i-0def
+#   fip status  CASE-2026-0001
+#   fip release --case CASE-2026-0001 --to 444455556666
+#   fip verify  manifest.json
+#
+# Put it on your PATH once and stop thinking about paths:
+#
+#   ln -s "$PWD/bin/fip" /usr/local/bin/fip
+#
+# A symlink works from anywhere: this script resolves its own real location to
+# find its subcommands, so it does not care what directory you are in. That
+# matters because the one time it gets used is the one time nobody wants to
+# remember where the repo was checked out.
+#
+# Manual: docs/MANUAL.md
+
+set -euo pipefail
+
+# Resolve $0 through any chain of symlinks WITHOUT relying on `readlink -f`,
+# which is GNU-only and absent on macOS before coreutils. An operator's laptop
+# is the most likely place this runs and the least likely to be uniform.
+resolve_self() {
+    local src="${BASH_SOURCE[0]}" dir
+    while [ -L "$src" ]; do
+        dir="$(cd -P "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        # A relative symlink target resolves against the link's directory.
+        case "$src" in
+            /*) ;;
+            *) src="$dir/$src" ;;
+        esac
+    done
+    cd -P "$(dirname "$src")" && pwd
+}
+
+BIN_DIR="$(resolve_self)"
+CDK_DIR="$(cd -P "$BIN_DIR/.." && pwd)"
+
+usage() {
+    cat >&2 <<'EOF'
+fip — Forensic Isolation Program
+
+Usage: fip <command> [options]
+
+Responding to an incident:
+  instances [--member ID]              List instances in the member accounts,
+                                       as targets isolate and restore take.
+  isolate <account>:<instance> [...]   Contain and acquire. One case, any number
+                                       of instances, across any number of
+                                       accounts. Pre-flights every target first.
+  status <case-id>                     Where a case stands, per target.
+  evidence <case-id> [--out DIR]       Download a case's manifests and custody
+                                       records, and verify each one.
+  restore <account>:<instance>         Put a contained instance back on its
+                                       original security groups, from the
+                                       signed manifest. Plans first.
+
+Handing evidence to an examiner:
+  release --case <id> --to <account>   Grant an analysis account access to a
+                                       case's evidence. Add --revoke to withdraw.
+  verify <file>                        Has a manifest or custody record changed
+                                       since it was signed? Needs only the file.
+         ... --ours                    And was it signed by this installation?
+         ... --key-id ARN             And was it signed by your KMS key?
+                                       Needs orchestrator credentials.
+         ... --public-key FILE         The same, against a key file from
+                                       signing-key. Needs no AWS access.
+  signing-key [--out FILE]             Export the public signing key, to give to
+                                       anyone who must check where a record came from.
+
+Setting up:
+  configure                            Collect and check account ids and
+                                       profiles; saves ~/.fip/install.env.
+  deploy                               Install or update every stack from that
+                                       configuration, checking each step.
+  test-instance [--member ID]          Testing only: launch an instance to try
+                                       FIP on, tagged for cleanup --test.
+  cleanup --list | --test              List what FIP made (application=fipv2), or
+                                       remove what a test made (fip:class=test).
+  doctor                               Check this install can do its job.
+  accounts                             How to resolve your FIP account ids.
+
+  help [command]                       Longer help for one command.
+  version
+
+Every command takes --help.
+EOF
+}
+
+# Subcommands live in their own scripts so each stays independently testable
+# and readable; this file is dispatch and nothing else.
+run_script() {
+    local script="$BIN_DIR/$1"; shift
+    [ -x "$script" ] || { echo "ERROR: $script is missing or not executable" >&2; exit 1; }
+    exec "$script" "$@"
+}
+
+cmd_version() {
+    local version="unknown"
+    if [ -f "$CDK_DIR/package.json" ] && command -v jq >/dev/null 2>&1; then
+        version="$(jq -r '.version // "unknown"' "$CDK_DIR/package.json")"
+    fi
+    echo "fip $version"
+    if git -C "$CDK_DIR" rev-parse --short HEAD >/dev/null 2>&1; then
+        echo "  commit $(git -C "$CDK_DIR" rev-parse --short HEAD)"
+    fi
+    echo "  installed at $BIN_DIR"
+}
+
+cmd_accounts() {
+    # discover-accounts.sh EXPORTS variables, so it has to be sourced by your
+    # shell — a subprocess could not change the environment of its parent.
+    # Printing the instruction is honest; pretending to run it would not be.
+    cat <<EOF
+FIP needs two account ids (a third, for analysis, is optional):
+
+  export FIP_ORCHESTRATOR_ACCOUNT_ID=<orchestrator>
+  export FIP_EVIDENCE_ACCOUNT_ID=<evidence>
+  export FIP_ANALYSIS_ACCOUNT_ID=<analysis>     # optional
+
+If you run AWS Organizations, look them up by account name instead. This must
+be SOURCED, not run, because it exports into your shell:
+
+  source $BIN_DIR/discover-accounts.sh
+
+Currently set in this shell:
+  FIP_ORCHESTRATOR_ACCOUNT_ID = ${FIP_ORCHESTRATOR_ACCOUNT_ID:-<unset>}
+  FIP_EVIDENCE_ACCOUNT_ID     = ${FIP_EVIDENCE_ACCOUNT_ID:-<unset>}
+  FIP_ANALYSIS_ACCOUNT_ID     = ${FIP_ANALYSIS_ACCOUNT_ID:-<unset>}
+EOF
+}
+
+# The responder commands run as the orchestrator. When this shell has not
+# chosen credentials, use the profile and region `fip configure` saved, so
+# `fip doctor` or `fip isolate` does not quietly run as whatever the default
+# profile is (and report a healthy install as broken). An AWS_PROFILE or
+# AWS_REGION already set wins. configure, deploy and cleanup name a profile
+# for every call themselves.
+use_saved_orchestrator() {
+    local config="${FIP_CONFIG:-$HOME/.fip/install.env}" profile region
+    [ -f "$config" ] || return 0
+    profile="$(sed -n 's/^export FIP_ORCHESTRATOR_PROFILE=//p' "$config" | tail -1)"
+    region="$(sed -n 's/^export AWS_REGION=//p' "$config" | tail -1)"
+    if [ -z "${AWS_PROFILE:-}" ] && [ -z "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "$profile" ]; then
+        export AWS_PROFILE="$profile"
+    fi
+    if [ -z "${AWS_REGION:-}" ] && [ -n "$region" ]; then
+        export AWS_REGION="$region"
+    fi
+    return 0
+}
+case "${1:-}" in
+    isolate|release|status|restore|verify|signing-key|doctor) use_saved_orchestrator ;;
+esac
+
+case "${1:-}" in
+    isolate)  shift; run_script fip-isolate.sh "$@" ;;
+    release)  shift; run_script fip-release.sh "$@" ;;
+    status)   shift; run_script fip-status.sh "$@" ;;
+    restore)  shift; run_script fip-restore.sh "$@" ;;
+    verify)   shift; run_script fip-verify.sh "$@" ;;
+    signing-key) shift; run_script fip-signing-key.sh "$@" ;;
+    doctor)   shift; run_script fip-doctor.sh "$@" ;;
+    accounts) shift; cmd_accounts "$@" ;;
+    configure) shift; run_script fip-configure.sh "$@" ;;
+    deploy)   shift; run_script fip-deploy.sh "$@" ;;
+    cleanup)  shift; run_script fip-cleanup.sh "$@" ;;
+    evidence) shift; run_script fip-evidence.sh "$@" ;;
+    instances) shift; run_script fip-instances.sh "$@" ;;
+    test-instance) shift; run_script fip-test-instance.sh "$@" ;;
+    version|--version|-V) cmd_version ;;
+    help|--help|-h|"") usage; [ -n "${1:-}" ] && exit 0 || exit 2 ;;
+    *)
+        echo "ERROR: unknown command '$1'" >&2
+        echo >&2
+        usage
+        exit 2
+        ;;
+esac

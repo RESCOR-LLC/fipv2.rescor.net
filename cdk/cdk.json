@@ -1,0 +1,13 @@
+{
+  "app": "node bin/fip-app.js",
+  "versionReporting": false,
+  "context": {
+    "@aws-cdk/aws-iam:minimizePolicies": true,
+    "@aws-cdk/aws-s3:createDefaultLoggingPolicy": true,
+    "@aws-cdk/aws-s3:serverAccessLogsUseBucketPolicy": true,
+    "fip:orgId": null,
+    "fip:productionMode": false,
+    "fip:retentionMode": "GOVERNANCE",
+    "fip:retentionDays": null
+  }
+}

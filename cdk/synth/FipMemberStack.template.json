@@ -1,0 +1,840 @@
+{
+ "Description": "FIP member-account payload — FipInventoryRole (read-only) only",
+ "Parameters": {
+  "OrchestratorAccountId": {
+   "Type": "String",
+   "AllowedPattern": "^[0-9]{12}$",
+   "ConstraintDescription": "Must be a 12-digit AWS account ID.",
+   "Description": "Account ID of the FIP orchestrator, the only principal permitted to assume this role."
+  },
+  "EvidenceAccountId": {
+   "Type": "String",
+   "AllowedPattern": "^[0-9]{12}$",
+   "ConstraintDescription": "Must be a 12-digit AWS account ID.",
+   "Description": "Account ID holding the FIP evidence bucket and forensic CMK. The only account this role may grant access to the member key."
+  },
+  "ExternalId": {
+   "Type": "String",
+   "AllowedPattern": "^[A-Za-z0-9+=,.@:/-]{16,1224}$",
+   "ConstraintDescription": "At least 16 characters, alphanumeric plus + = , . @ : / - and no spaces.",
+   "Description": "Unpredictable per-account identifier issued by the FIP orchestrator operator, required on sts:AssumeRole. Not a secret — it is visible in this role trust policy. Do not invent your own value; use the one you were issued, or the confused-deputy protection it provides is void."
+  },
+  "DeployResponderRole": {
+   "Type": "String",
+   "Default": "Yes",
+   "AllowedValues": [
+    "Yes",
+    "No"
+   ],
+   "Description": "Deploy the mutating FipResponderRole. Choose No to grant read-only inventory now and activate response capability later."
+  },
+  "AllowRestore": {
+   "Type": "String",
+   "Default": "Yes",
+   "AllowedValues": [
+    "Yes",
+    "No"
+   ],
+   "Description": "Let FIP restore a contained instance to its original security groups (fip restore). No keeps restore a manual step with this account's own credentials."
+  }
+ },
+ "Resources": {
+  "FipInventoryRole33FBE6B1": {
+   "Type": "AWS::IAM::Role",
+   "Properties": {
+    "AssumeRolePolicyDocument": {
+     "Statement": [
+      {
+       "Action": "sts:AssumeRole",
+       "Condition": {
+        "StringEquals": {
+         "sts:ExternalId": {
+          "Ref": "ExternalId"
+         }
+        }
+       },
+       "Effect": "Allow",
+       "Principal": {
+        "AWS": {
+         "Fn::Join": [
+          "",
+          [
+           "arn:",
+           {
+            "Ref": "AWS::Partition"
+           },
+           ":iam::",
+           {
+            "Ref": "OrchestratorAccountId"
+           },
+           ":root"
+          ]
+         ]
+        }
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    },
+    "Description": "FIP read-only inventory. Assumed constantly; can change nothing.",
+    "RoleName": "FipInventoryRole",
+    "Tags": [
+     {
+      "Key": "application",
+      "Value": "fipv2"
+     },
+     {
+      "Key": "fip:class",
+      "Value": "infrastructure"
+     },
+     {
+      "Key": "fip:component",
+      "Value": "member"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "FipMemberStack/FipInventoryRole/Resource"
+   }
+  },
+  "FipInventoryRoleDefaultPolicy8007DEB1": {
+   "Type": "AWS::IAM::Policy",
+   "Properties": {
+    "PolicyDocument": {
+     "Statement": [
+      {
+       "Action": [
+        "autoscaling:DescribeAutoScalingGroups",
+        "autoscaling:DescribeAutoScalingInstances",
+        "ec2:DescribeImages",
+        "ec2:DescribeInstanceAttribute",
+        "ec2:DescribeInstanceStatus",
+        "ec2:DescribeInstances",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribeSecurityGroupRules",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeSnapshotAttribute",
+        "ec2:DescribeSnapshots",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeTags",
+        "ec2:DescribeVolumes",
+        "ec2:DescribeVpcs",
+        "ecs:DescribeContainerInstances",
+        "ecs:ListContainerInstances",
+        "eks:DescribeCluster",
+        "eks:ListClusters",
+        "elasticloadbalancing:DescribeTargetGroups",
+        "elasticloadbalancing:DescribeTargetHealth",
+        "kms:DescribeKey",
+        "ssm:DescribeInstanceInformation"
+       ],
+       "Effect": "Allow",
+       "Resource": "*",
+       "Sid": "FipReadOnlyInventory"
+      }
+     ],
+     "Version": "2012-10-17"
+    },
+    "PolicyName": "FipInventoryRoleDefaultPolicy8007DEB1",
+    "Roles": [
+     {
+      "Ref": "FipInventoryRole33FBE6B1"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "FipMemberStack/FipInventoryRole/DefaultPolicy/Resource"
+   }
+  },
+  "ResponderFipResponderBoundaryAA6126CC": {
+   "Type": "AWS::IAM::ManagedPolicy",
+   "Properties": {
+    "Description": "Ceiling for FipResponderRole — cannot be exceeded by policy edits.",
+    "ManagedPolicyName": "FipResponderBoundary",
+    "Path": "/",
+    "PolicyDocument": {
+     "Statement": [
+      {
+       "Action": [
+        "autoscaling:DescribeAutoScalingGroups",
+        "autoscaling:DescribeAutoScalingInstances",
+        "autoscaling:DetachInstances",
+        "autoscaling:ResumeProcesses",
+        "autoscaling:SuspendProcesses",
+        "ebs:GetSnapshotBlock",
+        "ebs:ListChangedBlocks",
+        "ebs:ListSnapshotBlocks",
+        "ec2:CreateSecurityGroup",
+        "ec2:CreateSnapshot",
+        "ec2:CreateSnapshots",
+        "ec2:CreateTags",
+        "ec2:DeleteTags",
+        "ec2:DescribeImages",
+        "ec2:DescribeInstanceAttribute",
+        "ec2:DescribeInstanceStatus",
+        "ec2:DescribeInstances",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribeSecurityGroupRules",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeSnapshotAttribute",
+        "ec2:DescribeSnapshots",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeTags",
+        "ec2:DescribeVolumes",
+        "ec2:DescribeVpcs",
+        "ec2:ModifyInstanceAttribute",
+        "ec2:ModifyNetworkInterfaceAttribute",
+        "ec2:ModifySnapshotAttribute",
+        "ec2:RevokeSecurityGroupEgress",
+        "ec2:RevokeSecurityGroupIngress",
+        "ec2:StopInstances",
+        "ecs:DescribeContainerInstances",
+        "ecs:ListContainerInstances",
+        "ecs:UpdateContainerInstancesState",
+        "eks:DescribeCluster",
+        "eks:ListClusters",
+        "elasticloadbalancing:DeregisterTargets",
+        "elasticloadbalancing:DescribeTargetGroups",
+        "elasticloadbalancing:DescribeTargetHealth",
+        "kms:CreateGrant",
+        "kms:Decrypt",
+        "kms:DescribeKey",
+        "kms:GenerateDataKey",
+        "kms:GenerateDataKeyWithoutPlaintext",
+        "kms:ReEncryptFrom",
+        "kms:ReEncryptTo",
+        "ssm:CancelCommand",
+        "ssm:DescribeInstanceInformation",
+        "ssm:GetCommandInvocation",
+        "ssm:ListCommandInvocations",
+        "ssm:SendCommand"
+       ],
+       "Effect": "Allow",
+       "Resource": "*",
+       "Sid": "CeilingAllow"
+      },
+      {
+       "Action": [
+        "account:*",
+        "iam:*",
+        "organizations:*"
+       ],
+       "Effect": "Deny",
+       "Resource": "*",
+       "Sid": "NeverEscalate"
+      },
+      {
+       "Action": [
+        "ec2:DeleteSnapshot",
+        "ec2:TerminateInstances"
+       ],
+       "Effect": "Deny",
+       "Resource": "*",
+       "Sid": "NeverDestroyEvidenceOrHosts"
+      }
+     ],
+     "Version": "2012-10-17"
+    }
+   },
+   "Metadata": {
+    "aws:cdk:path": "FipMemberStack/Responder/FipResponderBoundary/Resource"
+   },
+   "Condition": "ResponderEnabled"
+  },
+  "ResponderFipResponderRole374D03B0": {
+   "Type": "AWS::IAM::Role",
+   "Properties": {
+    "AssumeRolePolicyDocument": {
+     "Statement": [
+      {
+       "Action": "sts:AssumeRole",
+       "Condition": {
+        "StringEquals": {
+         "sts:ExternalId": {
+          "Ref": "ExternalId"
+         }
+        }
+       },
+       "Effect": "Allow",
+       "Principal": {
+        "AWS": {
+         "Fn::Join": [
+          "",
+          [
+           "arn:",
+           {
+            "Ref": "AWS::Partition"
+           },
+           ":iam::",
+           {
+            "Ref": "OrchestratorAccountId"
+           },
+           ":root"
+          ]
+         ]
+        }
+       }
+      }
+     ],
+     "Version": "2012-10-17"
+    },
+    "Description": "FIP acquisition and containment. Assumed only during a case; every assumption should raise an alarm.",
+    "PermissionsBoundary": {
+     "Ref": "ResponderFipResponderBoundaryAA6126CC"
+    },
+    "RoleName": "FipResponderRole",
+    "Tags": [
+     {
+      "Key": "application",
+      "Value": "fipv2"
+     },
+     {
+      "Key": "fip:class",
+      "Value": "infrastructure"
+     },
+     {
+      "Key": "fip:component",
+      "Value": "member"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "FipMemberStack/Responder/FipResponderRole/Resource"
+   },
+   "Condition": "ResponderEnabled"
+  },
+  "ResponderFipResponderRoleDefaultPolicy7E06842A": {
+   "Type": "AWS::IAM::Policy",
+   "Properties": {
+    "PolicyDocument": {
+     "Statement": [
+      {
+       "Action": [
+        "autoscaling:DescribeAutoScalingGroups",
+        "autoscaling:DescribeAutoScalingInstances",
+        "ec2:DescribeImages",
+        "ec2:DescribeInstanceAttribute",
+        "ec2:DescribeInstanceStatus",
+        "ec2:DescribeInstances",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribeSecurityGroupRules",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeSnapshotAttribute",
+        "ec2:DescribeSnapshots",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeTags",
+        "ec2:DescribeVolumes",
+        "ec2:DescribeVpcs",
+        "ecs:DescribeContainerInstances",
+        "ecs:ListContainerInstances",
+        "eks:DescribeCluster",
+        "eks:ListClusters",
+        "elasticloadbalancing:DescribeTargetGroups",
+        "elasticloadbalancing:DescribeTargetHealth",
+        "kms:DescribeKey",
+        "ssm:DescribeInstanceInformation"
+       ],
+       "Effect": "Allow",
+       "Resource": "*",
+       "Sid": "Read"
+      },
+      {
+       "Action": "ec2:CreateTags",
+       "Condition": {
+        "ForAllValues:StringLike": {
+         "aws:TagKeys": [
+          "fip:*",
+          "application"
+         ]
+        },
+        "StringEqualsIfExists": {
+         "aws:RequestTag/application": "fipv2"
+        }
+       },
+       "Effect": "Allow",
+       "Resource": "*",
+       "Sid": "TagFipArtifactsOnly"
+      },
+      {
+       "Action": [
+        "ec2:CreateSnapshot",
+        "ec2:CreateSnapshots"
+       ],
+       "Condition": {
+        "StringLike": {
+         "aws:ResourceTag/fip:case-id": "*"
+        }
+       },
+       "Effect": "Allow",
+       "Resource": [
+        {
+         "Fn::Join": [
+          "",
+          [
+           "arn:",
+           {
+            "Ref": "AWS::Partition"
+           },
+           ":ec2:*:*:instance/*"
+          ]
+         ]
+        },
+        {
+         "Fn::Join": [
+          "",
+          [
+           "arn:",
+           {
+            "Ref": "AWS::Partition"
+           },
+           ":ec2:*:*:volume/*"
+          ]
+         ]
+        }
+       ],
+       "Sid": "AcquireFromTaggedSources"
+      },
+      {
+       "Action": [
+        "ec2:CreateSnapshot",
+        "ec2:CreateSnapshots",
+        "ec2:CreateTags"
+       ],
+       "Condition": {
+        "StringLike": {
+         "aws:RequestTag/fip:case-id": "*"
+        }
+       },
+       "Effect": "Allow",
+       "Resource": {
+        "Fn::Join": [
+         "",
+         [
+          "arn:",
+          {
+           "Ref": "AWS::Partition"
+          },
+          ":ec2:*:*:snapshot/*"
+         ]
+        ]
+       },
+       "Sid": "CreateTaggedSnapshots"
+      },
+      {
+       "Action": [
+        "ebs:GetSnapshotBlock",
+        "ebs:ListChangedBlocks",
+        "ebs:ListSnapshotBlocks",
+        "ec2:ModifySnapshotAttribute"
+       ],
+       "Condition": {
+        "StringLike": {
+         "aws:ResourceTag/fip:case-id": "*"
+        }
+       },
+       "Effect": "Allow",
+       "Resource": "*",
+       "Sid": "HashAndTransferTaggedEvidence"
+      },
+      {
+       "Action": "kms:DescribeKey",
+       "Effect": "Allow",
+       "Resource": "*",
+       "Sid": "ReadMemberKeyMetadata"
+      },
+      {
+       "Action": [
+        "kms:Decrypt",
+        "kms:GenerateDataKey",
+        "kms:GenerateDataKeyWithoutPlaintext",
+        "kms:ReEncryptFrom",
+        "kms:ReEncryptTo"
+       ],
+       "Condition": {
+        "StringEquals": {
+         "kms:ViaService": {
+          "Fn::Join": [
+           "",
+           [
+            "ec2.",
+            {
+             "Ref": "AWS::Region"
+            },
+            ".amazonaws.com"
+           ]
+          ]
+         }
+        }
+       },
+       "Effect": "Allow",
+       "Resource": "*",
+       "Sid": "UseMemberKeyViaEbsOnly"
+      },
+      {
+       "Action": "kms:CreateGrant",
+       "Condition": {
+        "Bool": {
+         "kms:GrantIsForAWSResource": "true"
+        }
+       },
+       "Effect": "Allow",
+       "Resource": "*",
+       "Sid": "AllowEbsServiceCreatedGrant"
+      },
+      {
+       "Action": "kms:CreateGrant",
+       "Condition": {
+        "StringEquals": {
+         "kms:GranteePrincipal": {
+          "Fn::Join": [
+           "",
+           [
+            "arn:",
+            {
+             "Ref": "AWS::Partition"
+            },
+            ":iam::",
+            {
+             "Ref": "EvidenceAccountId"
+            },
+            ":root"
+           ]
+          ]
+         }
+        }
+       },
+       "Effect": "Allow",
+       "Resource": "*",
+       "Sid": "GrantEvidenceAccountOnly"
+      },
+      {
+       "Action": [
+        "ec2:ModifyInstanceAttribute",
+        "ec2:ModifyNetworkInterfaceAttribute",
+        "ec2:StopInstances"
+       ],
+       "Condition": {
+        "StringLike": {
+         "aws:ResourceTag/fip:case-id": "*"
+        }
+       },
+       "Effect": "Allow",
+       "Resource": "*",
+       "Sid": "ContainTaggedInstances"
+      },
+      {
+       "Action": [
+        "ssm:CancelCommand",
+        "ssm:GetCommandInvocation",
+        "ssm:ListCommandInvocations",
+        "ssm:SendCommand"
+       ],
+       "Condition": {
+        "StringLike": {
+         "ssm:resourceTag/fip:case-id": "*"
+        }
+       },
+       "Effect": "Allow",
+       "Resource": [
+        {
+         "Fn::Join": [
+          "",
+          [
+           "arn:",
+           {
+            "Ref": "AWS::Partition"
+           },
+           ":ec2:*:*:instance/*"
+          ]
+         ]
+        },
+        {
+         "Fn::Join": [
+          "",
+          [
+           "arn:",
+           {
+            "Ref": "AWS::Partition"
+           },
+           ":ssm:*:*:document/AWS-RunPowerShellScript"
+          ]
+         ]
+        },
+        {
+         "Fn::Join": [
+          "",
+          [
+           "arn:",
+           {
+            "Ref": "AWS::Partition"
+           },
+           ":ssm:*:*:document/AWS-RunShellScript"
+          ]
+         ]
+        }
+       ],
+       "Sid": "GuestTriageOnTaggedInstances"
+      },
+      {
+       "Action": "ec2:CreateSecurityGroup",
+       "Effect": "Allow",
+       "Resource": {
+        "Fn::Join": [
+         "",
+         [
+          "arn:",
+          {
+           "Ref": "AWS::Partition"
+          },
+          ":ec2:*:*:vpc/*"
+         ]
+        ]
+       },
+       "Sid": "CreateIsolationSgInAnyVpc"
+      },
+      {
+       "Action": [
+        "ec2:CreateSecurityGroup",
+        "ec2:CreateTags"
+       ],
+       "Condition": {
+        "StringLike": {
+         "aws:RequestTag/fip:isolation": "*"
+        }
+       },
+       "Effect": "Allow",
+       "Resource": {
+        "Fn::Join": [
+         "",
+         [
+          "arn:",
+          {
+           "Ref": "AWS::Partition"
+          },
+          ":ec2:*:*:security-group/*"
+         ]
+        ]
+       },
+       "Sid": "CreateIsolationSgBornTagged"
+      },
+      {
+       "Action": [
+        "ec2:RevokeSecurityGroupEgress",
+        "ec2:RevokeSecurityGroupIngress"
+       ],
+       "Condition": {
+        "StringLike": {
+         "aws:ResourceTag/fip:isolation": "*"
+        }
+       },
+       "Effect": "Allow",
+       "Resource": {
+        "Fn::Join": [
+         "",
+         [
+          "arn:",
+          {
+           "Ref": "AWS::Partition"
+          },
+          ":ec2:*:*:security-group/*"
+         ]
+        ]
+       },
+       "Sid": "StripRulesFromOwnIsolationSg"
+      },
+      {
+       "Action": "ec2:ModifyNetworkInterfaceAttribute",
+       "Condition": {
+        "StringLike": {
+         "aws:ResourceTag/fip:case-id": "*"
+        }
+       },
+       "Effect": "Allow",
+       "Resource": [
+        {
+         "Fn::Join": [
+          "",
+          [
+           "arn:",
+           {
+            "Ref": "AWS::Partition"
+           },
+           ":ec2:*:*:instance/*"
+          ]
+         ]
+        },
+        {
+         "Fn::Join": [
+          "",
+          [
+           "arn:",
+           {
+            "Ref": "AWS::Partition"
+           },
+           ":ec2:*:*:network-interface/*"
+          ]
+         ]
+        },
+        {
+         "Fn::Join": [
+          "",
+          [
+           "arn:",
+           {
+            "Ref": "AWS::Partition"
+           },
+           ":ec2:*:*:security-group/*"
+          ]
+         ]
+        }
+       ],
+       "Sid": "ApplyIsolationToTaggedInterfaces"
+      },
+      {
+       "Action": [
+        "autoscaling:DetachInstances",
+        "autoscaling:ResumeProcesses",
+        "autoscaling:SuspendProcesses",
+        "ecs:UpdateContainerInstancesState",
+        "elasticloadbalancing:DeregisterTargets"
+       ],
+       "Effect": "Allow",
+       "Resource": "*",
+       "Sid": "FleetContainmentUnscoped"
+      }
+     ],
+     "Version": "2012-10-17"
+    },
+    "PolicyName": "ResponderFipResponderRoleDefaultPolicy7E06842A",
+    "Roles": [
+     {
+      "Ref": "ResponderFipResponderRole374D03B0"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "FipMemberStack/Responder/FipResponderRole/DefaultPolicy/Resource"
+   },
+   "Condition": "ResponderEnabled"
+  },
+  "RestoreFipRestorePolicy0D4471C3": {
+   "Type": "AWS::IAM::Policy",
+   "Properties": {
+    "PolicyDocument": {
+     "Statement": [
+      {
+       "Action": "ec2:ModifyNetworkInterfaceAttribute",
+       "Effect": "Allow",
+       "Resource": {
+        "Fn::Join": [
+         "",
+         [
+          "arn:",
+          {
+           "Ref": "AWS::Partition"
+          },
+          ":ec2:*:",
+          {
+           "Ref": "AWS::AccountId"
+          },
+          ":security-group/*"
+         ]
+        ]
+       },
+       "Sid": "AttachOriginalGroupsOnRestore"
+      },
+      {
+       "Action": "ec2:DeleteTags",
+       "Condition": {
+        "StringLike": {
+         "aws:ResourceTag/fip:case-id": "*"
+        },
+        "ForAllValues:StringEquals": {
+         "aws:TagKeys": [
+          "fip:original-sgs"
+         ]
+        },
+        "Null": {
+         "aws:TagKeys": "false"
+        }
+       },
+       "Effect": "Allow",
+       "Resource": {
+        "Fn::Join": [
+         "",
+         [
+          "arn:",
+          {
+           "Ref": "AWS::Partition"
+          },
+          ":ec2:*:",
+          {
+           "Ref": "AWS::AccountId"
+          },
+          ":network-interface/*"
+         ]
+        ]
+       },
+       "Sid": "ClearOriginalGroupsTagOnly"
+      }
+     ],
+     "Version": "2012-10-17"
+    },
+    "PolicyName": "FipRestorePolicy",
+    "Roles": [
+     {
+      "Ref": "ResponderFipResponderRole374D03B0"
+     }
+    ]
+   },
+   "Metadata": {
+    "aws:cdk:path": "FipMemberStack/Restore/FipRestorePolicy/Resource"
+   },
+   "Condition": "RestoreEnabled"
+  }
+ },
+ "Outputs": {
+  "InventoryRoleArn": {
+   "Value": {
+    "Fn::GetAtt": [
+     "FipInventoryRole33FBE6B1",
+     "Arn"
+    ]
+   }
+  },
+  "ResponderRoleArn": {
+   "Value": {
+    "Fn::GetAtt": [
+     "ResponderFipResponderRole374D03B0",
+     "Arn"
+    ]
+   },
+   "Condition": "ResponderEnabled"
+  }
+ },
+ "Conditions": {
+  "ResponderEnabled": {
+   "Fn::Equals": [
+    {
+     "Ref": "DeployResponderRole"
+    },
+    "Yes"
+   ]
+  },
+  "RestoreEnabled": {
+   "Fn::And": [
+    {
+     "Condition": "ResponderEnabled"
+    },
+    {
+     "Fn::Equals": [
+      {
+       "Ref": "AllowRestore"
+      },
+      "Yes"
+     ]
+    }
+   ]
+  }
+ }
+}
