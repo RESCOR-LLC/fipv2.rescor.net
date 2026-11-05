@@ -191,3 +191,67 @@ describe('isolation run summary across reruns of one id', () => {
     assert.deepStrictEqual([s.state, s.failed, s.targetCount], ['FAILED', 2, 2]);
   });
 });
+
+describe('isolations attached to a case', () => {
+  const RUN = 'fip-20261105T140000Z-a1b2c3';
+
+  test('members are <run>/<instance>, checked, de-duplicated and sorted', async () => {
+    const { attachedMembers } = await load();
+    const m = attachedMembers(RUN, [
+      { accountId: '222222222222', instanceId: 'i-0bbbbbbbbbbbbbbbb' },
+      { accountId: '111111111111', instanceId: 'i-0aaaaaaaaaaaaaaaa' },
+      { accountId: '111111111111', instanceId: 'i-0aaaaaaaaaaaaaaaa' },
+    ]);
+    assert.deepStrictEqual(m.map((x) => x.member), [
+      `${RUN}/i-0aaaaaaaaaaaaaaaa`, `${RUN}/i-0bbbbbbbbbbbbbbbb`]);
+  });
+
+  test('a member that would be wrong forever is refused before it is signed', async () => {
+    const { attachedMembers } = await load();
+    const ok = { accountId: '111111111111', instanceId: 'i-0aaaaaaaaaaaaaaaa' };
+    assert.throws(() => attachedMembers(CASE, [ok]), /not an isolation run/);
+    assert.throws(() => attachedMembers('test', [ok]), /not an isolation run/);
+    assert.throws(() => attachedMembers(RUN, [{ ...ok, accountId: '1111' }]), /account id/);
+    assert.throws(() => attachedMembers(RUN, [{ ...ok, instanceId: 'vol-1' }]), /instance id/);
+    assert.throws(() => attachedMembers(RUN, []), /at least one/);
+  });
+
+  test('MEMBER_ATTACHED is a log event, and never the first', async () => {
+    const { buildCaseEvent, CASE_EVENTS } = await load();
+    assert.ok(CASE_EVENTS.has('MEMBER_ATTACHED'));
+    assert.throws(() => buildCaseEvent({
+      caseId: CASE, seq: 1, event: 'MEMBER_ATTACHED', at: 't', actor: 'a', prev: null,
+    }), /first record/);
+  });
+
+  test('the row gains one member entry per member, and applying it twice is harmless', async () => {
+    const { buildCaseEvent, rowUpdateFor, attachedMembers } = await load();
+    const members = attachedMembers(RUN, [
+      { accountId: '111111111111', instanceId: 'i-0aaaaaaaaaaaaaaaa' },
+      { accountId: '222222222222', instanceId: 'i-0bbbbbbbbbbbbbbbb' },
+    ]);
+    const doc = buildCaseEvent({
+      caseId: CASE, seq: 3, event: 'MEMBER_ATTACHED', at: '2026-11-05T14:00:01Z', actor: 'arn:x',
+      prev: { seq: 2, key: 'k', sha256: 'h' }, data: { actionId: RUN, members },
+    });
+    const u = rowUpdateFor(doc, 'head');
+    assert.match(u.UpdateExpression, /#members\.#m0 = :m0/);
+    assert.match(u.UpdateExpression, /#members\.#m1 = :m1/);
+    assert.doesNotMatch(u.UpdateExpression, /ADD/, 'SET only: a replay must not add anything twice');
+    assert.strictEqual(u.ExpressionAttributeNames['#m1'], `${RUN}/i-0bbbbbbbbbbbbbbbb`);
+    assert.deepStrictEqual(u.ExpressionAttributeValues[':m1'].M.attachedSeq, { N: '3' });
+    assert.deepStrictEqual(u.ExpressionAttributeValues[':m1'].M.actionId, { S: RUN });
+    assert.strictEqual(u.ConditionExpression, 'attribute_not_exists(#seq) OR #seq < :seq');
+  });
+
+  test('an attach record chains and verifies like any other', async () => {
+    const { verifyCaseLog } = await load();
+    const records = await logOf([
+      ['OPENED', { tickets: ['INC-1'], comment: null }],
+      ['MEMBER_ATTACHED', { actionId: RUN, members: [
+        { member: `${RUN}/i-0aaaaaaaaaaaaaaaa`, accountId: '111111111111', instanceId: 'i-0aaaaaaaaaaaaaaaa' }] }],
+    ]);
+    const r = verifyCaseLog(CASE, records);
+    assert.ok(r.ok, r.problems.join('; '));
+  });
+});

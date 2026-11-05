@@ -337,13 +337,11 @@ Reference: [§6.13](#613-fip-cleanup).
 | **Exactly what to isolate**, and expect nothing more | `fip isolate` alone (§4) | One run, one record. A case would only add bookkeeping |
 | **There is an incident, but not yet every instance in it**, or more may turn up during assessment and containment | `fip case` (§5.3), then `fip isolate --case` for each host as you find it | Every isolation, release and restore is kept together under one incident, with its tickets and comments |
 
-Until `fip isolate --case` is built (§5.3), open the case for its tickets and comments,
-and keep the incident's isolations under one run id with `--case-id` (§5.2).
-
-`fip isolate` will never open or join a case on its own. Once `--case` exists, if a case
-is open when you run it without `--case`, it says so and lists the open cases, then
-proceeds without one. A host isolated that way can be moved into the case afterwards
-with `fip case move`.
+`fip isolate` will never open or join a case on its own. It joins one only when you name
+it with `--case` or `--ticket`. If a case is open when you run it without either, it
+says so and lists the open cases, then proceeds without one. Containment never waits on
+case bookkeeping. A host isolated that way can be moved into the case afterwards with
+`fip case move` once that is built (§5.3).
 
 ### 5.2 What a single isolation records
 
@@ -356,6 +354,7 @@ own id, `fip-<UTC time>-<random>`, which keys everything it made:
 | Evidence bucket, `cases/<id>/<instance-id>/manifest.json` | One signed manifest per target |
 | Evidence bucket, `cases/<id>/custody/` | Signed records of each release, revoke and restore |
 | `fip:case-id` tag | On each instance, its volumes and interfaces, and every snapshot |
+| `fip:case` tag | On every snapshot and evidence copy of a run made with `--case`: the incident case. A convenience for the console, not evidence; the case log is the record |
 
 | State | Meaning |
 |---|---|
@@ -368,15 +367,17 @@ A run is not rolled back because one instance was unreachable. Its records stay 
 long as retention (§8) and your own policy say.
 
 `fip isolate --case-id <id> <targets>` adds targets to an earlier run's id. Use it to
-rerun failed targets. **Until `fip isolate --case` exists it is also the way to keep a
-growing incident's isolations under one id.** The state and counts describe every run
-under the id, and a later run that succeeds clears an earlier run's failure.
+rerun failed targets. The state and counts describe every run under the id, and a later
+run that succeeds clears an earlier run's failure. For a growing incident, use a case
+(§5.3) rather than one ever-larger run. A run made with `--case` stays in that case:
+re-running its id with a different `--case` is refused.
 
 ### 5.3 `fip case`
 
-> **Partly built.** `open`, `list`, `show`, `ticket` and `comment` work now (§6.15).
-> `fip isolate --case`, `move`, `merge`, `close` and `reopen` are in development; the
-> example below shows the whole design so the workflow can be planned around it.
+> **Partly built.** `open`, `list`, `show`, `ticket`, `comment` and `fip isolate --case`
+> work now (§6.15, §6.6). `move`, `merge`, `close` and `reopen` are in development, and
+> so are case-wide `status`, `restore`, `release` and `evidence`. The example below
+> shows the whole design so the workflow can be planned around it.
 
 A **case** is one incident. It holds the isolations made under it (each still a
 `fip isolate` run, with its own id and records, unchanged), tickets from your own
@@ -403,7 +404,7 @@ fip case close $CASE --comment "contained; RCA in INC-1234"
 | `fip case show <case> [--verify]` | The case as a timeline, with its log verified | Yes |
 | `fip case ticket <case> T [--comment C]` | Add a ticket. A case may carry several, from different systems | Yes |
 | `fip case comment <case> C` | Add a signed, permanent comment | Yes |
-| `fip isolate --case <case>` | Record an isolation run under the case | Next |
+| `fip isolate --case <case>` | Record an isolation run under the case | Yes |
 | `fip case move <isolation or target>… --to <case> --comment C` | Move a whole isolation (`fip-…`) or one target of it (`fip-…/i-…`) into another case | Next |
 | `fip case merge <into> <from>… --comment C` | Fold whole cases into one. Each `<from>` becomes an alias of `<into>` | Later |
 | `fip case close <case> --comment C [--force]` | Close. Refused while any host is still contained or any evidence is still shared; `--force` overrides, and is recorded | Later |
@@ -599,7 +600,8 @@ It confirms first and prints the case id near the top.
 | `--dry-run` | Pre-flight only. Starts nothing; the case id it prints is thrown away |
 | `--watch` | Then follow the case until it finishes, as `fip status --watch` |
 | `--case-id ID` | Add the targets to an earlier run (§5.2). Default: a new id |
-| `--case CASE` | **Not built yet** (§5.3): record this run under an incident case. Meanwhile `--case-id` refuses a `case-…` id |
+| `--case CASE` | Record this run under an open incident case (§5.3). Checked before anything is touched: a closed or unknown case stops the run in pre-flight |
+| `--ticket T` | The same, naming the case by a ticket exactly one case carries |
 | `--stop` | Stop each instance after containment. **Off** by default: it is service-affecting and loses instance-store data |
 | `--allow-replacement` | Let an Auto Scaling group launch a replacement. **Off** by default; [§9](#why-a-replacement-is-not-launched-by-default) says why |
 | `--yes` | Skip the confirmation |
@@ -811,6 +813,12 @@ named, `--ticket T` also works if exactly one case carries that ticket.
 | `show` | State, tickets and a timeline of every event, with who did it. Given an isolation run's id (`fip-…`), shows that run instead |
 | `ticket` | Adds a ticket from your own system. Refused if the case already carries it, or is not open |
 | `comment` | Adds a comment. It is signed and permanent, so write it as you would a note in a case file |
+
+**Isolating into a case.** `fip isolate --case C` (or `--ticket T`) records the run's
+targets in the case as it starts, before any host is touched. Each target becomes a
+**member**, named `<run id>/<instance id>`. One `MEMBER_ATTACHED` record names them, and
+`show` lists them. A closed or unknown case refuses the run at its first step. The run's
+own id, records and evidence are unchanged; the case only points at them.
 
 **The case log.** Each event is a signed record, schema `fip.case/1`, at
 `cases/<case-id>/log/<sequence>.json` in the evidence bucket, under the same Object Lock
