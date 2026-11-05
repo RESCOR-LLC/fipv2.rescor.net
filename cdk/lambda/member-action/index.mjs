@@ -27,7 +27,7 @@ import {
   SuspendProcessesCommand,
 } from '@aws-sdk/client-auto-scaling';
 import {
-  KMSClient, CreateGrantCommand, SignCommand, GetPublicKeyCommand,
+  KMSClient, CreateGrantCommand, SignCommand, GetPublicKeyCommand, DescribeKeyCommand,
   ListGrantsCommand, RetireGrantCommand,
 } from '@aws-sdk/client-kms';
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
@@ -1053,100 +1053,79 @@ async function releaseToAnalysis(event, creds) {
   const ec2 = ec2For(creds);
   const kms = new KMSClient({ region: REGION, credentials: creds });
 
-  // 1. The snapshot share. createVolumePermission is what lets the analysis
-  //    account turn a snapshot into a volume; it confers no delete.
-  for (const snapshotId of copies) {
-    await ec2.send(new ModifySnapshotAttributeCommand({
-      SnapshotId: snapshotId,
-      Attribute: 'createVolumePermission',
-      OperationType: revoke ? 'remove' : 'add',
-      UserIds: [String(target)],
+  // The share (createVolumePermission, which confers no delete) and the
+  // grant on the forensic key: a shared encrypted snapshot is useless
+  // without the grant, and a grant left after an unshare is access nobody
+  // can see in the snapshot's permissions. Only grants this release created,
+  // by name: retiring one another case depends on would silently break it.
+  const { grants, rollback } = await applyRelease({
+    ec2, kms, copies, target: String(target), revoke,
+    grantNames: [`fip-${caseId}`],
+  });
+
+  let key;
+  let custody;
+  let recorded = false;
+  try {
+    // 3. The record. Signed with the same key as the manifest, so a custody
+    //    event is exactly as verifiable as the acquisition it refers to.
+    custody = {
+      schema: 'fip.custody/1',
+      caseId,
+      event: revoke ? 'REVOKED_FROM_ANALYSIS' : 'RELEASED_TO_ANALYSIS',
+      at: new Date().toISOString(),
+      analysisAccountId: String(target),
+      evidenceAccountId: EVIDENCE_ACCOUNT,
+      snapshots: copies,
+      kmsGrantIds: grants,
+      actor,
+      note: revoke
+        ? 'Snapshot share removed and the case KMS grant retired. Existing volumes already created from these snapshots are NOT destroyed by this.'
+        : 'Analysis account may create volumes from these snapshots and decrypt them. It cannot delete them, cannot re-encrypt under the forensic key, and cannot widen its own access.',
+    };
+
+    const envelope = await signEnvelope('custody', custody, 'custody.json');
+    key = `cases/${caseId}/custody/${custody.at.replace(/[:.]/g, '-')}-${revoke ? 'revoke' : 'release'}.json`;
+
+    const s3 = new S3Client({ region: REGION, credentials: creds });
+    await s3.send(new PutObjectCommand({
+      Bucket: EVIDENCE_BUCKET,
+      Key: key,
+      Body: JSON.stringify(envelope, null, 2),
+      ContentType: 'application/json',
+      ...objectLock(),
     }));
-  }
+    recorded = true;
 
-  // 2. The key. A shared encrypted snapshot is useless without grant access to
-  //    the CMK it is encrypted under, and conversely a grant left behind after
-  //    an unshare is access nobody can see in the snapshot's permissions.
-  let grants = [];
-  if (revoke) {
-    const listed = await kms.send(new ListGrantsCommand({
-      KeyId: EVIDENCE_KEY_ALIAS,
-      GranteePrincipal: `arn:aws:iam::${target}:root`,
-    }));
-    for (const grant of listed.Grants ?? []) {
-      // Only grants this release created. Retiring a grant some other case or
-      // engagement depends on would silently break it.
-      if (grant.Name !== `fip-${caseId}`) continue;
-      await kms.send(new RetireGrantCommand({
-        KeyId: EVIDENCE_KEY_ALIAS, GrantId: grant.GrantId,
-      }));
-      grants.push(grant.GrantId);
-    }
-  } else {
-    const grant = await kms.send(new CreateGrantCommand({
-      KeyId: EVIDENCE_KEY_ALIAS,
-      GranteePrincipal: `arn:aws:iam::${target}:root`,
-      // Named so revoke can find exactly the grants this case created.
-      Name: `fip-${caseId}`,
-      // Read paths only. No Encrypt, no ReEncrypt, no CreateGrant: an examiner
-      // must be able to READ evidence and must not be able to produce new
-      // ciphertext under the forensic key or widen their own access.
-      Operations: ['Decrypt', 'DescribeKey'],
-    }));
-    grants.push(grant.GrantId);
-  }
-
-  // 3. The record. Signed with the same key as the manifest, so a custody
-  //    event is exactly as verifiable as the acquisition it refers to.
-  const custody = {
-    schema: 'fip.custody/1',
-    caseId,
-    event: revoke ? 'REVOKED_FROM_ANALYSIS' : 'RELEASED_TO_ANALYSIS',
-    at: new Date().toISOString(),
-    analysisAccountId: String(target),
-    evidenceAccountId: EVIDENCE_ACCOUNT,
-    snapshots: copies,
-    kmsGrantIds: grants,
-    actor,
-    note: revoke
-      ? 'Snapshot share removed and the case KMS grant retired. Existing volumes already created from these snapshots are NOT destroyed by this.'
-      : 'Analysis account may create volumes from these snapshots and decrypt them. It cannot delete them, cannot re-encrypt under the forensic key, and cannot widen its own access.',
-  };
-
-  const envelope = await signEnvelope('custody', custody, 'custody.json');
-  const key = `cases/${caseId}/custody/${custody.at.replace(/[:.]/g, '-')}-${revoke ? 'revoke' : 'release'}.json`;
-
-  const s3 = new S3Client({ region: REGION, credentials: creds });
-  await s3.send(new PutObjectCommand({
-    Bucket: EVIDENCE_BUCKET,
-    Key: key,
-    Body: JSON.stringify(envelope, null, 2),
-    ContentType: 'application/json',
-    ...objectLock(),
-  }));
-
-  // Appended, never overwritten. The history of who held this evidence is
-  // itself part of the record, so a revoke must not erase the release.
-  const ddb = new DynamoDBClient({ region: REGION, credentials: creds });
-  await ddb.send(new UpdateItemCommand({
-    TableName: CASE_TABLE,
-    Key: { caseId: { S: caseId } },
-    UpdateExpression: 'SET custody = list_append(if_not_exists(custody, :empty), :entry)',
-    ExpressionAttributeValues: {
-      ':empty': { L: [] },
-      ':entry': {
-        L: [{
-          M: {
-            event: { S: custody.event },
-            at: { S: custody.at },
-            analysisAccountId: { S: String(target) },
-            recordKey: { S: key },
-            snapshotCount: { N: String(copies.length) },
-          },
-        }],
+    // Appended, never overwritten. The history of who held this evidence is
+    // itself part of the record, so a revoke must not erase the release.
+    const ddb = new DynamoDBClient({ region: REGION, credentials: creds });
+    await ddb.send(new UpdateItemCommand({
+      TableName: CASE_TABLE,
+      Key: { caseId: { S: caseId } },
+      UpdateExpression: 'SET custody = list_append(if_not_exists(custody, :empty), :entry)',
+      ExpressionAttributeValues: {
+        ':empty': { L: [] },
+        ':entry': {
+          L: [{
+            M: {
+              event: { S: custody.event },
+              at: { S: custody.at },
+              analysisAccountId: { S: String(target) },
+              recordKey: { S: key },
+              snapshotCount: { N: String(copies.length) },
+            },
+          }],
+        },
       },
-    },
-  }));
+    }));
+  } catch (err) {
+    // Undo access only while nothing says it was given. Once the signed
+    // record exists, the access it describes stays, and the error says so.
+    if (!recorded) await rollback(err);
+    else err.message = `access was given and its signed record written (${key}), but: ${err.message}`;
+    throw err;
+  }
 
   return {
     caseId,
@@ -1466,6 +1445,82 @@ async function containmentOf(instanceId, creds) {
   return { contained: isolated.length > 0, isolationGroups: isolated };
 }
 
+/**
+ * The forensic key's ARN. CreateGrant, ListGrants and RetireGrant take a key
+ * id or ARN, never an alias; DescribeKey takes the alias.
+ */
+let evidenceKeyArnCache = null;
+async function evidenceKeyArn(kms) {
+  if (!evidenceKeyArnCache) {
+    const d = await kms.send(new DescribeKeyCommand({ KeyId: EVIDENCE_KEY_ALIAS }));
+    evidenceKeyArnCache = d.KeyMetadata.Arn;
+  }
+  return evidenceKeyArnCache;
+}
+
+/**
+ * Grant or withdraw access: the snapshot shares and the KMS grant(s).
+ *
+ * The key is resolved before anything changes. A release creates the grant
+ * FIRST and shares second, so a failure part-way leaves no share behind:
+ * a grant alone opens nothing, because the account cannot reach a snapshot
+ * that is not shared to it. Returns `rollback`, which undoes a release if a
+ * later step (the signed record) fails, so access never exists unrecorded.
+ * A revoke removes shares first, then retires grants; repeating one is safe.
+ */
+async function applyRelease({ ec2, kms, copies, target, revoke, grantNames }) {
+  const keyId = await evidenceKeyArn(kms);
+  const principal = `arn:aws:iam::${target}:root`;
+  const share = (snapshotId, op) => ec2.send(new ModifySnapshotAttributeCommand({
+    SnapshotId: snapshotId, Attribute: 'createVolumePermission', OperationType: op, UserIds: [target],
+  }));
+
+  if (revoke) {
+    for (const snapshotId of copies) await share(snapshotId, 'remove');
+    const grants = [];
+    let marker;
+    do {
+      const listed = await kms.send(new ListGrantsCommand({ KeyId: keyId, GranteePrincipal: principal, Marker: marker }));
+      for (const g of listed.Grants ?? []) {
+        if (!grantNames.includes(g.Name)) continue;
+        await kms.send(new RetireGrantCommand({ KeyId: keyId, GrantId: g.GrantId }));
+        grants.push(g.GrantId);
+      }
+      marker = listed.Truncated ? listed.NextMarker : undefined;
+    } while (marker);
+    return { grants, rollback: async () => {} };
+  }
+
+  const g = await kms.send(new CreateGrantCommand({
+    KeyId: keyId, GranteePrincipal: principal,
+    // Named so a revoke finds exactly the grants this case created.
+    Name: grantNames[0],
+    // Read paths only: no Encrypt, ReEncrypt or CreateGrant. An examiner
+    // reads evidence; they cannot make new ciphertext under the forensic key
+    // or widen their own access.
+    Operations: ['Decrypt', 'DescribeKey'],
+  }));
+  const shared = [];
+  const rollback = async (cause) => {
+    for (const snapshotId of shared) {
+      try { await share(snapshotId, 'remove'); } catch (e) { console.error(`rollback: unshare ${snapshotId}`, e, cause); }
+    }
+    try { await kms.send(new RetireGrantCommand({ KeyId: keyId, GrantId: g.GrantId })); } catch (e) {
+      console.error(`rollback: retire grant ${g.GrantId}`, e, cause);
+    }
+  };
+  try {
+    for (const snapshotId of copies) {
+      await share(snapshotId, 'add');
+      shared.push(snapshotId);
+    }
+  } catch (err) {
+    await rollback(err);
+    throw err;
+  }
+  return { grants: [g.GrantId], rollback };
+}
+
 /** The KMS grant names a case's releases may have used: its own and every case merged into it. */
 async function grantNamesFor(ddb, caseId) {
   const names = new Set();
@@ -1512,34 +1567,18 @@ async function releaseCase(event, creds) {
 
   const ec2 = ec2For(creds);
   const kms = new KMSClient({ region: REGION, credentials: creds });
-  for (const snapshotId of copies) {
-    await ec2.send(new ModifySnapshotAttributeCommand({
-      SnapshotId: snapshotId, Attribute: 'createVolumePermission',
-      OperationType: revoke ? 'remove' : 'add', UserIds: [target],
-    }));
+  const { grants, rollback } = await applyRelease({ ec2, kms, copies, target, revoke, grantNames });
+  try {
+    return await recordCaseRelease({ caseId, plan, view, members, copies, grants, grantNames, revoke, target, actor }, ddb, creds);
+  } catch (err) {
+    // As for a single run: undo access only while no signed record says it was given.
+    if (!err.recordKey) await rollback(err);
+    else err.message = `access was given and its signed record written (${err.recordKey}), but: ${err.message}`;
+    throw err;
   }
-  const grants = [];
-  if (revoke) {
-    let marker;
-    do {
-      const listed = await kms.send(new ListGrantsCommand({
-        KeyId: EVIDENCE_KEY_ALIAS, GranteePrincipal: `arn:aws:iam::${target}:root`, Marker: marker,
-      }));
-      for (const g of listed.Grants ?? []) {
-        if (!grantNames.includes(g.Name)) continue;
-        await kms.send(new RetireGrantCommand({ KeyId: EVIDENCE_KEY_ALIAS, GrantId: g.GrantId }));
-        grants.push(g.GrantId);
-      }
-      marker = listed.Truncated ? listed.NextMarker : undefined;
-    } while (marker);
-  } else {
-    const g = await kms.send(new CreateGrantCommand({
-      KeyId: EVIDENCE_KEY_ALIAS, GranteePrincipal: `arn:aws:iam::${target}:root`,
-      Name: `fip-${caseId}`, Operations: ['Decrypt', 'DescribeKey'],
-    }));
-    grants.push(g.GrantId);
-  }
+}
 
+async function recordCaseRelease({ caseId, plan, view, members, copies, grants, grantNames, revoke, target, actor }, ddb, creds) {
   const custody = {
     schema: 'fip.custody/1',
     caseId,
@@ -1564,38 +1603,43 @@ async function releaseCase(event, creds) {
     ContentType: 'application/json', ...objectLock(),
   }));
 
-  // On each run's row too, naming the instances: share state is per member,
-  // and it follows the member into whatever case holds it later.
-  const byRun = new Map();
-  for (const m of members) {
-    const a = view.members.find((x) => x.member === m.member);
-    if (!byRun.has(a.actionId)) byRun.set(a.actionId, []);
-    byRun.get(a.actionId).push(a.instanceId);
-  }
-  for (const [actionId, instances] of byRun) {
-    await ddb.send(new UpdateItemCommand({
-      TableName: CASE_TABLE, Key: { caseId: { S: actionId } },
-      UpdateExpression: 'SET custody = list_append(if_not_exists(custody, :empty), :entry)',
-      ExpressionAttributeValues: {
-        ':empty': { L: [] },
-        ':entry': { L: [{ M: {
-          event: { S: custody.event }, at: { S: custody.at }, analysisAccountId: { S: target },
-          recordKey: { S: key }, snapshotCount: { N: String(copies.length) },
-          instances: { SS: instances }, incident: { S: caseId },
-        } }] },
-      },
-    }));
-  }
+  try {
+    // On each run's row too, naming the instances: share state is per member,
+    // and it follows the member into whatever case holds it later.
+    const byRun = new Map();
+    for (const m of members) {
+      const a = view.members.find((x) => x.member === m.member);
+      if (!byRun.has(a.actionId)) byRun.set(a.actionId, []);
+      byRun.get(a.actionId).push(a.instanceId);
+    }
+    for (const [actionId, instances] of byRun) {
+      await ddb.send(new UpdateItemCommand({
+        TableName: CASE_TABLE, Key: { caseId: { S: actionId } },
+        UpdateExpression: 'SET custody = list_append(if_not_exists(custody, :empty), :entry)',
+        ExpressionAttributeValues: {
+          ':empty': { L: [] },
+          ':entry': { L: [{ M: {
+            event: { S: custody.event }, at: { S: custody.at }, analysisAccountId: { S: target },
+            recordKey: { S: key }, snapshotCount: { N: String(copies.length) },
+            instances: { SS: instances }, incident: { S: caseId },
+          } }] },
+        },
+      }));
+    }
 
-  const record = await appendCaseEvent({
-    caseId, event: revoke ? 'REVOKED' : 'RELEASED', actor,
-    data: { analysisAccountId: target, members: custody.members, snapshots: copies, kmsGrantNames: grantNames, custodyKey: key },
-  }, creds);
-  return {
-    caseId, event: custody.event, analysisAccountId: target, members: custody.members,
-    snapshots: copies, kmsGrantIds: grants, kmsGrantNames: grantNames, custodyRecordKey: key,
-    record, withoutEvidence: plan.withoutEvidence,
-  };
+    const record = await appendCaseEvent({
+      caseId, event: revoke ? 'REVOKED' : 'RELEASED', actor,
+      data: { analysisAccountId: target, members: custody.members, snapshots: copies, kmsGrantNames: grantNames, custodyKey: key },
+    }, creds);
+    return {
+      caseId, event: custody.event, analysisAccountId: target, members: custody.members,
+      snapshots: copies, kmsGrantIds: grants, kmsGrantNames: grantNames, custodyRecordKey: key,
+      record, withoutEvidence: plan.withoutEvidence,
+    };
+  } catch (err) {
+    err.recordKey = key;
+    throw err;
+  }
 }
 
 /**
