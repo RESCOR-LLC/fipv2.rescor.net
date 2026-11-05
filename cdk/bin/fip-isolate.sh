@@ -85,6 +85,15 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# An incident case's id names a case row, not an isolation run, and the two
+# share a table. --case-id reuses an earlier RUN's id.
+case "${CASE_ID:-}" in case-*)
+    echo "ERROR: $CASE_ID is an incident case, not an isolation run." >&2
+    echo "       --case-id takes an earlier run's id (fip-...). Attaching a run to an" >&2
+    echo "       incident case is not built yet; see manual §5." >&2
+    exit 2 ;;
+esac
+
 command -v aws >/dev/null 2>&1 || { echo "ERROR: aws CLI not installed" >&2; exit 1; }
 command -v jq  >/dev/null 2>&1 || { echo "ERROR: jq not installed" >&2; exit 1; }
 
