@@ -637,7 +637,7 @@ fip status <case-id | --ticket T> [--watch]
 
 **Given an incident case** (`case-…`), it lists every member: its account, how its
 acquisition stands, whether its host is **still contained** (asked of the member
-account through the restore planner, which changes nothing), and which analysis
+account: is any interface on an FIP isolation group; this changes nothing), and which analysis
 accounts its evidence is **shared to**. Release state is per member: it follows the
 evidence into whatever case holds it now, so a merged case can show some members
 shared and some not. `--watch` refreshes while any member is still acquiring; for a

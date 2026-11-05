@@ -75,8 +75,8 @@ export function custodyOf(row) {
 
 /**
  * Whether a case may close, from its members' state. Contained: an
- * interface is not on its original groups (the restore planner's RESTORE or
- * BLOCKED). Shared: any analysis account can still create volumes. A member
+ * interface is on an FIP isolation group. Shared: any analysis account can
+ * still create volumes. A member
  * whose state could not be read blocks too: closing on a guess is not a
  * close.
  */

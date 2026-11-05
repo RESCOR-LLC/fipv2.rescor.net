@@ -1396,7 +1396,7 @@ async function caseAction(event, creds) {
  * Every member of a case, with where its acquisition stands, its evidence
  * copies, and which analysis accounts can open them. With `containment`,
  * also whether its host is still contained, asked of the member account
- * through the restore planner, which changes nothing.
+ * from its network interfaces (containmentOf), which changes nothing.
  */
 async function caseMembers(caseId, { containment = false } = {}, creds) {
   const ddb = new DynamoDBClient({ region: REGION, credentials: creds });
@@ -1421,8 +1421,7 @@ async function caseMembers(caseId, { containment = false } = {}, creds) {
     };
     if (containment) {
       try {
-        const plan = await restoreInstance({ instanceId }, await memberCredentials(m.accountId, actionId));
-        m.contained = plan.plan.some((p) => p.status === 'RESTORE' || p.status === 'BLOCKED');
+        Object.assign(m, await containmentOf(instanceId, await memberCredentials(m.accountId, actionId)));
       } catch (err) {
         if (/not found|InvalidInstanceID/i.test(`${err.name} ${err.message}`)) {
           m.contained = false;
@@ -1443,6 +1442,28 @@ async function caseMembers(caseId, { containment = false } = {}, creds) {
     mergedInto: row.mergedInto?.S ?? null,
     members,
   };
+}
+
+/**
+ * Whether a host is contained now: any of its interfaces is on an FIP
+ * isolation group (tag key fip:isolation). Read from the instance itself,
+ * so it holds while acquisition is still running and before any manifest
+ * exists. Changes nothing.
+ */
+async function containmentOf(instanceId, creds) {
+  const ec2 = ec2For(creds);
+  const d = await ec2.send(new DescribeInstancesCommand({ InstanceIds: [instanceId] }));
+  const inst = d.Reservations?.[0]?.Instances?.[0];
+  if (!inst || inst.State?.Name === 'terminated') {
+    return { contained: false, containmentNote: 'instance no longer exists' };
+  }
+  const groups = [...new Set((inst.NetworkInterfaces ?? []).flatMap((n) => (n.Groups ?? []).map((g) => g.GroupId)))];
+  if (!groups.length) return { contained: false, containmentNote: 'no network interfaces' };
+  const iso = await ec2.send(new DescribeSecurityGroupsCommand({
+    GroupIds: groups, Filters: [{ Name: 'tag-key', Values: [ISOLATION_TAG] }],
+  }));
+  const isolated = (iso.SecurityGroups ?? []).map((g) => g.GroupId);
+  return { contained: isolated.length > 0, isolationGroups: isolated };
 }
 
 /** The KMS grant names a case's releases may have used: its own and every case merged into it. */
