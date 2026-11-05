@@ -289,3 +289,27 @@ describe('the Lambda is told the retention and environment', () => {
       ['GOVERNANCE', '90', 'production']);
   });
 });
+
+describe('an isolation run can be attached to an incident case', () => {
+  test('the incident is read from OpenCase\'s result, so an input without it stays valid', () => {
+    const def = definitionOf(synth().template, 'FipCase');
+    assert.strictEqual(
+      def.States.AcquireTargets.ItemSelector['incident.$'], '$.case.incident',
+      'OpenCase checks the case and returns incident (null when standalone). Reading ' +
+      '$.incident here would make every start-execution without it fail.',
+    );
+    const childInput = def.States.AcquireTargets.ItemProcessor
+      .States.AcquireTarget.Parameters.Input;
+    assert.strictEqual(childInput['incident.$'], '$.incident');
+  });
+
+  test('each acquisition reads it from TagTarget\'s result, where it always exists', () => {
+    const def = definitionOf(synth().template, 'FipAcquisition');
+    assert.strictEqual(def.States.TagTarget.Parameters['request.$'], '$',
+      'a hand-run FipAcquisition has no incident; the whole input keeps it optional');
+    for (const state of ['CreateSnapshots', 'CopyToEvidence']) {
+      assert.strictEqual(def.States[state].Parameters['incident.$'], '$.target.incident',
+        `${state} tags what it creates with fip:case, read from the tag step's normalized result`);
+    }
+  });
+});

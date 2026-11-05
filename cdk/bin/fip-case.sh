@@ -41,6 +41,9 @@ isolation, `fip isolate` alone is enough (manual §5.1).
 
 Wherever a case is named, --ticket T also works if exactly one case carries
 that ticket.
+
+Isolations join a case only when named: fip isolate --case C (or --ticket T).
+Each such run's targets are recorded in the case's log as MEMBER_ATTACHED.
 EOF
 }
 
@@ -80,36 +83,9 @@ invoke() {  # $1 = JSON payload
 actor() { orchestrator sts get-caller-identity --query Arn --output text; }
 
 # ── Reads, from the case table ───────────────────────────────────────────
-scan_cases() {  # every row, as one JSON array of items
-    evidence dynamodb scan --table-name fip-cases \
-        --projection-expression 'caseId, kind, #s, openedAt, tickets, logSeq, lastEventAt, targetCount, succeededCount, failedCount' \
-        --expression-attribute-names '{"#s":"state"}' --output json \
-        | jq '.Items'
-}
-
-get_row() {  # $1 = id; prints the item, or nothing
-    evidence dynamodb get-item --table-name fip-cases --consistent-read \
-        --key "$(jq -cn --arg id "$1" '{caseId: {S: $id}}')" --output json \
-        | jq -c '.Item // empty'
-}
-
-# A case named directly, or by a ticket exactly one case carries.
-resolve() {  # $1 = id or empty, $2 = ticket or empty
-    local id="$1" ticket="$2" matches
-    if [ -n "$id" ] && [ -n "$ticket" ]; then
-        echo "ERROR: name the case or a ticket, not both" >&2; exit 2
-    fi
-    if [ -n "$id" ]; then printf '%s' "$id"; return; fi
-    [ -n "$ticket" ] || { echo "ERROR: name a case, or --ticket T" >&2; exit 2; }
-    matches="$(scan_cases | jq -r --arg t "$ticket" \
-        '[.[] | select(.kind.S == "case" and ((.tickets.SS // []) | index($t)))] | .[].caseId.S')"
-    case "$(printf '%s' "$matches" | grep -c . || true)" in
-        0) echo "ERROR: no case carries ticket $ticket" >&2; exit 1 ;;
-        1) printf '%s' "$matches" ;;
-        *) echo "ERROR: several cases carry ticket $ticket; name one:" >&2
-           printf '  %s\n' $matches >&2; exit 1 ;;
-    esac
-}
+# scan_cases, get_row and resolve.
+# shellcheck source=fip-case-lib.sh
+. "$BIN_DIR/fip-case-lib.sh"
 
 new_case_id() {
     # A collision suffix on a UTC timestamp, not a secret.
@@ -137,8 +113,9 @@ cmd_open() {
     echo "Opened case $id"
     [ "$tickets" = "[]" ] || echo "Tickets ......... $(jq -r 'join(", ")' <<<"$tickets")"
     echo
-    echo "Set it for the next steps:"
+    echo "Set it for the next steps, then isolate into it:"
     echo "  CASE=$id"
+    echo "  fip isolate --case \$CASE <account-id>:<instance-id> ..."
 }
 
 cmd_list() {
@@ -222,7 +199,10 @@ cmd_show() {
       "Case ............ \(.caseId.S)",
       "State ........... \(.state.S // "?")",
       "Opened .......... \(.openedAt.S // "?")  by \(.openedBy.S // "?")",
-      "Tickets ......... " + ((.tickets.SS // []) | if length > 0 then join(", ") else "none" end)
+      "Tickets ......... " + ((.tickets.SS // []) | if length > 0 then join(", ") else "none" end),
+      "Members ......... " + ((.members.M // {}) | length | tostring),
+      ((.members.M // {}) | to_entries | sort_by(.key)[]
+        | "  \(.key)  account \(.value.M.accountId.S // "?")")
     ' <<<"$row"
     echo
     echo "Timeline:"
@@ -230,6 +210,8 @@ cmd_show() {
       "  \(.seq // "?")  \(.at // "?")  \(.event // "?")"
       + (if .event == "OPENED" and ((.tickets // []) | length) > 0 then "  tickets \(.tickets | join(", "))" else "" end)
       + (if .event == "TICKET_ADDED" then "  \(.ticket)" else "" end)
+      + (if .event == "MEMBER_ATTACHED" then "  \(.actionId)"
+           + ((.members // [])[] | "\n        \(.accountId):\(.instanceId)") else "" end)
       + (if .comment then "\n        \(.comment)" else "" end)
       + "\n        by \(.actor // "?")"
     ' "$WORK_DIR/log.json"

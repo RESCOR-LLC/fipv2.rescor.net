@@ -4,6 +4,7 @@
 #
 #   ./bin/fip-isolate.sh 111111111111:i-0123456789abcdef0
 #   ./bin/fip-isolate.sh 1111:i-aaa 2222:i-bbb 2222:i-ccc      # one case, 3 targets
+#   ./bin/fip-isolate.sh --case case-20261105T140000Z-1a2b3c 1111:i-aaa
 #
 # Everything it does could be done with `aws stepfunctions start-execution`
 # and a hand-written JSON payload. The reason it exists is that hand-writing
@@ -31,6 +32,8 @@
 set -euo pipefail
 
 CASE_ID=""
+INCIDENT=""
+INCIDENT_TICKET=""
 STOP_INSTANCE="false"
 ASG_POLICY="prevent-replacement"
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
@@ -44,8 +47,12 @@ usage() {
 Usage: fip-isolate.sh [options] <account-id>:<instance-id> [<account-id>:<instance-id> ...]
 
 Options:
-  --case-id ID   Case id to use. Default: fip-<UTC timestamp>-<random>.
-                 Reuse an existing id to add targets to a case already open.
+  --case C       Attach this run to incident case C (from fip case open).
+  --ticket T     Attach it to the one incident case that carries ticket T.
+                 Without either, the run is standalone; if any case is open,
+                 they are listed first so a forgotten --case is noticed.
+  --case-id ID   Isolation run id to use. Default: fip-<UTC timestamp>-<random>.
+                 Reuse an existing id to add targets to a run already made.
   --stop         Stop each instance after containment. OFF by default: it is
                  service-affecting and loses instance-store data for good.
   --allow-replacement
@@ -65,6 +72,8 @@ Options:
 
 Examples:
   fip-isolate.sh 111122223333:i-0abc
+  fip-isolate.sh --case case-20261105T140000Z-1a2b3c 111122223333:i-0abc
+  fip-isolate.sh --ticket INC-4471 111122223333:i-0abc
   fip-isolate.sh --stop --case-id fip-2026-0042 111122223333:i-0abc 444455556666:i-0def
   fip-isolate.sh --dry-run 111122223333:i-0abc
 EOF
@@ -73,6 +82,8 @@ EOF
 while [ $# -gt 0 ]; do
     case "$1" in
         --case-id) CASE_ID="${2:?--case-id needs a value}"; shift 2 ;;
+        --case)    INCIDENT="${2:?--case needs a case id}"; shift 2 ;;
+        --ticket)  INCIDENT_TICKET="${2:?--ticket needs a value}"; shift 2 ;;
         --stop)    STOP_INSTANCE="true"; shift ;;
         --allow-replacement) ASG_POLICY="allow-replacement"; shift ;;
         --region)  REGION="${2:?--region needs a value}"; shift 2 ;;
@@ -86,13 +97,16 @@ while [ $# -gt 0 ]; do
 done
 
 # An incident case's id names a case row, not an isolation run, and the two
-# share a table. --case-id reuses an earlier RUN's id.
+# share a table. --case-id reuses an earlier RUN's id; --case names the case.
 case "${CASE_ID:-}" in case-*)
     echo "ERROR: $CASE_ID is an incident case, not an isolation run." >&2
-    echo "       --case-id takes an earlier run's id (fip-...). Attaching a run to an" >&2
-    echo "       incident case is not built yet; see manual §5." >&2
+    echo "       To isolate into it: --case $CASE_ID" >&2
     exit 2 ;;
 esac
+if [ -n "$INCIDENT" ] && [ -n "$INCIDENT_TICKET" ]; then
+    echo "ERROR: name the case or a ticket, not both" >&2
+    exit 2
+fi
 
 command -v aws >/dev/null 2>&1 || { echo "ERROR: aws CLI not installed" >&2; exit 1; }
 command -v jq  >/dev/null 2>&1 || { echo "ERROR: jq not installed" >&2; exit 1; }
@@ -101,6 +115,30 @@ if [ "${#TARGETS[@]}" -eq 0 ]; then
     echo "ERROR: name at least one target as <account-id>:<instance-id>" >&2
     usage
     exit 2
+fi
+
+# ── Incident case ────────────────────────────────────────────────────────
+# Read with the evidence profile, as `fip case` does. A run attaches to a case
+# ONLY when one is named: isolate never opens or guesses one. Without --case
+# or --ticket, the open cases are listed and the run proceeds standalone, so
+# containment never waits on case bookkeeping. A failure to read them is
+# reported and ignored, for the same reason.
+CONFIG_FILE="${FIP_CONFIG:-$HOME/.fip/install.env}"
+EVIDENCE_PROFILE=""
+[ -f "$CONFIG_FILE" ] && EVIDENCE_PROFILE="$(sed -n 's/^export FIP_EVIDENCE_PROFILE=//p' "$CONFIG_FILE" | tail -1)"
+EVIDENCE_PROFILE="${EVIDENCE_PROFILE:-fip-evidence}"
+evidence() { aws --profile "$EVIDENCE_PROFILE" --region "$REGION" "$@"; }
+# shellcheck source=fip-case-lib.sh
+. "$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fip-case-lib.sh"
+
+OPEN_CASES=""
+CASES_UNREADABLE=""
+if [ -n "$INCIDENT" ] || [ -n "$INCIDENT_TICKET" ]; then
+    INCIDENT="$(resolve "$INCIDENT" "$INCIDENT_TICKET")"
+    require_open_case "$INCIDENT"
+elif ! OPEN_CASES="$(open_cases 2>/dev/null)"; then
+    OPEN_CASES=""
+    CASES_UNREADABLE="yes"
 fi
 
 # Generated rather than asked for. An id invented under pressure tends to be
@@ -125,13 +163,28 @@ fi
 ORCHESTRATOR_ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 CALLER_ARN="$(aws sts get-caller-identity --query Arn --output text)"
 
-echo "FIP case ........ $CASE_ID"
+echo "Isolation run ... $CASE_ID"
+echo "Incident case ... ${INCIDENT:-none (standalone)}"
 echo "Region .......... $REGION"
 echo "Orchestrator .... $ORCHESTRATOR_ACCOUNT"
 echo "Running as ...... $CALLER_ARN"
 echo "Stop instances .. $STOP_INSTANCE"
 echo "ASG policy ...... $ASG_POLICY"
 echo
+
+if [ -n "$OPEN_CASES" ]; then
+    echo "NOTE: incident cases are open, and this run is not attached to any of them:"
+    while IFS=$'\t' read -r c_id c_opened c_tickets; do
+        printf '  %s  opened %s  tickets %s\n' "$c_id" "$c_opened" "$c_tickets"
+    done <<<"$OPEN_CASES"
+    echo "  Proceeding standalone. If these hosts belong to one, stop and re-run"
+    echo "  with --case; otherwise the run stays outside every case."
+    echo
+elif [ -n "$CASES_UNREADABLE" ]; then
+    echo "NOTE: could not read the case table as profile $EVIDENCE_PROFILE to check"
+    echo "      for open incident cases. Proceeding standalone."
+    echo
+fi
 
 # ── Pre-flight ───────────────────────────────────────────────────────────
 # Read-only, via FipInventoryRole. Every target is checked before ANY target
@@ -327,13 +380,16 @@ PAYLOAD="$(jq -cn \
     --arg caseId "$CASE_ID" \
     --argjson stopInstance "$STOP_INSTANCE" \
     --arg asgPolicy "$ASG_POLICY" \
+    --arg incident "$INCIDENT" \
+    --arg requestedBy "$CALLER_ARN" \
     --args '
     {
       caseId: $caseId,
       stopInstance: $stopInstance,
       asgPolicy: $asgPolicy,
+      requestedBy: $requestedBy,
       targets: [$ARGS.positional[] | split(":") | {accountId: .[0], instanceId: .[1]}]
-    }' "${VALIDATED[@]}")"
+    } + (if $incident == "" then {} else {incident: $incident} end)' "${VALIDATED[@]}")"
 
 CASE_MACHINE_ARN="arn:aws:states:${REGION}:${ORCHESTRATOR_ACCOUNT}:stateMachine:FipCase"
 
@@ -397,7 +453,8 @@ cat <<EOF
 
 Case started.
 
-  Case id ....... $CASE_ID
+  Run id ........ $CASE_ID
+  Incident case . ${INCIDENT:-none (standalone)}
   Execution ..... $EXECUTION_ARN
   Targets ....... ${#VALIDATED[@]}
   Expect ........ about ${EST_SPAN}; look into it after ${EST_AFTER}
@@ -416,6 +473,12 @@ A case finishes ACQUIRED (every target), PARTIAL (some targets) or FAILED
 (none). PARTIAL is a success for the targets that worked — their evidence and
 manifests are real. Re-running the same --case-id retries only what you name.
 EOF
+
+if [ -n "$INCIDENT" ]; then
+    echo
+    echo "The run's targets go into the case's signed log as it starts:"
+    echo "  ${PROFILE_PREFIX}fip case show $INCIDENT"
+fi
 
 if [ "$WATCH" = "true" ]; then
     echo

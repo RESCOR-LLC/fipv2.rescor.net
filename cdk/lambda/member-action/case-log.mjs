@@ -26,7 +26,32 @@ import { createHash, verify as cryptoVerify } from 'node:crypto';
 export const CASE_SCHEMA = 'fip.case/1';
 export const CASE_ID_PATTERN = /^case-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$/;
 export const ACTION_ID_PATTERN = /^fip-[A-Za-z0-9-]{1,120}$/;
-export const CASE_EVENTS = new Set(['OPENED', 'TICKET_ADDED', 'COMMENT']);
+export const CASE_EVENTS = new Set(['OPENED', 'TICKET_ADDED', 'COMMENT', 'MEMBER_ATTACHED']);
+export const isActionId = (id) => ACTION_ID_PATTERN.test(String(id ?? ''));
+const INSTANCE_ID_PATTERN = /^i-[0-9a-f]{8,17}$/;
+const ACCOUNT_ID_PATTERN = /^[0-9]{12}$/;
+
+/** A member is one target of one action: `<actionId>/<instanceId>`. */
+export const memberId = (actionId, instanceId) => `${actionId}/${instanceId}`;
+
+/**
+ * The members an isolation run brings into a case, from its requested
+ * targets. Checked here because they go into a signed record, which cannot be
+ * corrected afterwards.
+ */
+export function attachedMembers(actionId, targets = []) {
+  if (!isActionId(actionId)) throw new Error(`'${actionId}' is not an isolation run id (fip-…)`);
+  const seen = new Map();
+  for (const t of targets) {
+    const accountId = String(t?.accountId ?? '');
+    const instanceId = String(t?.instanceId ?? '');
+    if (!ACCOUNT_ID_PATTERN.test(accountId)) throw new Error(`'${accountId}' is not an account id`);
+    if (!INSTANCE_ID_PATTERN.test(instanceId)) throw new Error(`'${instanceId}' is not an instance id`);
+    seen.set(instanceId, { member: memberId(actionId, instanceId), accountId, instanceId });
+  }
+  if (!seen.size) throw new Error('an isolation run attaches at least one target');
+  return [...seen.values()].sort((a, b) => a.member.localeCompare(b.member));
+}
 
 const MAX_TEXT = 4000;
 const MAX_TICKET = 200;
@@ -105,6 +130,25 @@ export function rowUpdateFor(doc, sha256) {
   if (tickets.length) {
     add.push('tickets :tickets');
     values[':tickets'] = { SS: [...new Set(tickets)] };
+  }
+  // One map entry per member, each SET to the record's own values, so
+  // applying the record twice changes nothing. The members map exists from
+  // OPENED, which is what makes a nested SET possible.
+  if (doc.event === 'MEMBER_ATTACHED') {
+    names['#members'] = 'members';
+    (doc.members ?? []).forEach((m, i) => {
+      names[`#m${i}`] = m.member;
+      values[`:m${i}`] = {
+        M: {
+          actionId: { S: doc.actionId },
+          accountId: { S: m.accountId },
+          instanceId: { S: m.instanceId },
+          attachedSeq: { N: String(doc.seq) },
+          attachedAt: { S: doc.at },
+        },
+      };
+      set.push(`#members.#m${i} = :m${i}`);
+    });
   }
   return {
     UpdateExpression: `SET ${set.join(', ')}${add.length ? ` ADD ${add.join(', ')}` : ''}`,

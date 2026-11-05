@@ -149,6 +149,10 @@ class FipOrchestratorStack extends Stack {
         accountId: sfn.JsonPath.stringAt('$.accountId'),
         caseId: sfn.JsonPath.stringAt('$.caseId'),
         instanceId: sfn.JsonPath.stringAt('$.instanceId'),
+        // The whole input, so `incident` stays optional for a hand-run. The
+        // Lambda returns it as $.target.incident (null when absent), which is
+        // where the later states read it: that path always exists.
+        request: sfn.JsonPath.objectAt('$'),
       }),
       payloadResponseOnly: true,
       resultPath: '$.target',
@@ -206,6 +210,7 @@ class FipOrchestratorStack extends Stack {
         accountId: sfn.JsonPath.stringAt('$.accountId'),
         caseId: sfn.JsonPath.stringAt('$.caseId'),
         instanceId: sfn.JsonPath.stringAt('$.instanceId'),
+        incident: sfn.JsonPath.stringAt('$.target.incident'),
       }),
       payloadResponseOnly: true,
       resultPath: '$.acquisition',
@@ -315,6 +320,7 @@ class FipOrchestratorStack extends Stack {
         accountId: sfn.JsonPath.stringAt('$.accountId'),
         caseId: sfn.JsonPath.stringAt('$.caseId'),
         snapshots: sfn.JsonPath.listAt('$.acquisition.snapshots'),
+        incident: sfn.JsonPath.stringAt('$.target.incident'),
       }),
       payloadResponseOnly: true,
       resultPath: '$.evidenceCopy',
@@ -494,6 +500,7 @@ class FipOrchestratorStack extends Stack {
         instanceId: sfn.JsonPath.stringAt('$.instanceId'),
         stopInstance: sfn.JsonPath.objectAt('$.stopInstance'),
         asgPolicy: sfn.JsonPath.stringAt('$.asgPolicy'),
+        incident: sfn.JsonPath.stringAt('$.incident'),
       }),
       // No explicit execution name. A deterministic name would reject a
       // re-run of the same case id for 90 days with ExecutionAlreadyExists,
@@ -542,6 +549,10 @@ class FipOrchestratorStack extends Stack {
         'instanceId.$': '$$.Map.Item.Value.instanceId',
         'stopInstance.$': '$.case.stopInstance',
         'asgPolicy.$': '$.case.asgPolicy',
+        // The incident case, as OpenCase checked and recorded it: null when
+        // the run is standalone. Read from the normalized result, like the
+        // two above, so an input that omitted it stays valid.
+        'incident.$': '$.case.incident',
       },
       resultPath: '$.results',
     });

@@ -39,7 +39,7 @@ import { EBSClient, ListSnapshotBlocksCommand, GetSnapshotBlockCommand } from '@
 import { createHash, verify as cryptoVerify } from 'node:crypto';
 import {
   isCaseId, caseLogKey, sha256Hex, checkTicket, checkComment, buildCaseEvent,
-  rowUpdateFor, signedDocument, summarizeAction,
+  rowUpdateFor, signedDocument, summarizeAction, attachedMembers,
 } from './case-log.mjs';
 
 const REGION = process.env.AWS_REGION;
@@ -60,6 +60,14 @@ const DEFAULT_ASG_POLICY = 'prevent-replacement';
 
 const SIGNING_KEY_ALIAS = process.env.FIP_SIGNING_KEY_ALIAS ?? 'alias/fip-manifest-signing';
 const CASE_TAG = 'fip:case-id';
+/**
+ * The incident case an isolation run was attached to, on what the run
+ * creates. A convenience for the console and for cleanup, NOT evidence: the
+ * signed case log is the record of membership. fip:case-id above stays the
+ * run's own id, because permissions, grants and manifests are keyed on it.
+ */
+const INCIDENT_TAG = 'fip:case';
+const incidentTags = (incident) => (isCaseId(incident) ? [{ Key: INCIDENT_TAG, Value: incident }] : []);
 /**
  * Which instance a snapshot came from. Load-bearing once a case can cover more
  * than one instance: the reuse checks below used to match on the case tag
@@ -233,7 +241,12 @@ async function signEnvelope(documentKey, document, filename = `${documentKey}.js
 /** Tag the instance AND its volumes. Must happen first: every later statement
  *  in FipResponderRole is scoped by this tag, and ec2:CreateSnapshots is
  *  authorized against the source resources, not only the created snapshots. */
-async function tagTarget({ accountId, instanceId, caseId }, creds) {
+async function tagTarget({ accountId, instanceId, caseId, request = {} }, creds) {
+  // The incident case, if FipCase attached this run to one. Read from the
+  // whole input because it is optional: a hand-run FipAcquisition without it
+  // must still work. Returned so later states can read it from $.target,
+  // where it always exists.
+  const incident = isCaseId(request.incident) ? request.incident : null;
   const ec2 = ec2For(creds);
   const d = await ec2.send(new DescribeInstancesCommand({ InstanceIds: [instanceId] }));
   const inst = d.Reservations?.[0]?.Instances?.[0];
@@ -249,7 +262,7 @@ async function tagTarget({ accountId, instanceId, caseId }, creds) {
     Tags: [{ Key: CASE_TAG, Value: caseId }],
   }));
   return {
-    instanceId, volumes, enis,
+    instanceId, volumes, enis, incident,
     instanceType: inst.InstanceType,
     privateIp: inst.PrivateIpAddress,
     // The instance as found, for the manifest.
@@ -260,7 +273,7 @@ async function tagTarget({ accountId, instanceId, caseId }, creds) {
 /** Crash-consistent multi-volume snapshot. Born tagged, which is what makes
  *  every downstream permission scopeable. Idempotent by case tag: if snapshots
  *  for this case already exist we return them rather than making more. */
-async function createSnapshots({ instanceId, caseId }, creds) {
+async function createSnapshots({ instanceId, caseId, incident = null }, creds) {
   const ec2 = ec2For(creds);
 
   // Scoped by case AND INSTANCE. The case tag alone is not a unique key once
@@ -305,6 +318,7 @@ async function createSnapshots({ instanceId, caseId }, creds) {
       Tags: [
         { Key: CASE_TAG, Value: caseId },
         { Key: SOURCE_INSTANCE_TAG, Value: instanceId },
+        ...incidentTags(incident),
         ...productTags(evidenceClass(instance.Tags)),
       ],
     }],
@@ -652,7 +666,7 @@ async function stopInstance({ instanceId }, creds) {
  *
  * Idempotent by case tag: a retry returns the copies already made.
  */
-async function copyToEvidence({ snapshots, caseId, accountId }, creds) {
+async function copyToEvidence({ snapshots, caseId, accountId, incident = null }, creds) {
   const ec2 = ec2For(creds);
 
   // Idempotent PER SOURCE SNAPSHOT, not per case. The previous check matched
@@ -702,6 +716,7 @@ async function copyToEvidence({ snapshots, caseId, accountId }, creds) {
           { Key: CASE_TAG, Value: caseId },
           { Key: SOURCE_SNAPSHOT_TAG, Value: source },
           { Key: 'fip:source-account', Value: accountId },
+          ...incidentTags(incident),
           ...productTags(evidenceClass()),
         ],
       }],
@@ -859,6 +874,38 @@ async function caseOpen(event, creds) {
     throw new Error(`${caseId} is an incident case, not an isolation id; use --case to attach a run to it`);
   }
   const ddb = new DynamoDBClient({ region: REGION, credentials: creds });
+
+  // The incident case to attach to, only if the caller named one: isolate
+  // never opens or picks a case on its own. Checked BEFORE anything is
+  // written, so a refused attach leaves no trace and touches no host: this
+  // is FipCase's first state.
+  const incident = request.incident === undefined || request.incident === null || request.incident === ''
+    ? null : String(request.incident);
+  let members = [];
+  if (incident) {
+    if (!isCaseId(incident)) throw new Error(`'${incident}' is not an incident case id (case-<UTC>-<hex>)`);
+    members = attachedMembers(caseId, targets);
+    const caseRow = await readCaseRow(ddb, incident);
+    if (!caseRow || caseRow.kind?.S !== 'case') throw new Error(`no incident case ${incident}`);
+    if (caseRow.state?.S !== 'OPEN') {
+      throw new Error(`case ${incident} is ${caseRow.state?.S}; isolations attach only to open cases`);
+    }
+  }
+  const actor = typeof request.requestedBy === 'string' && request.requestedBy ? request.requestedBy : openedBy;
+
+  const attach = async () => {
+    if (!incident) return null;
+    // Idempotent: a retried OpenCase, or a re-run naming targets already
+    // attached, records only what the case does not hold yet.
+    const have = (await readCaseRow(ddb, incident))?.members?.M ?? {};
+    const missing = members.filter((m) => !have[m.member]);
+    if (!missing.length) return null;
+    return appendCaseEvent({
+      caseId: incident, event: 'MEMBER_ATTACHED', actor,
+      data: { actionId: caseId, executionArn: openedBy ?? null, members: missing },
+    }, creds);
+  };
+
   const now = new Date().toISOString();
   try {
     await ddb.send(new PutItemCommand({
@@ -880,10 +927,15 @@ async function caseOpen(event, creds) {
           })),
         },
         targets: { M: {} },
+        ...(incident ? { incident: { S: incident } } : {}),
       },
       ConditionExpression: 'attribute_not_exists(caseId)',
     }));
-    return { caseId, caseState: 'IN_PROGRESS', opened: true, openedAt: now, stopInstance, asgPolicy };
+    const attached = await attach();
+    return {
+      caseId, caseState: 'IN_PROGRESS', opened: true, openedAt: now, stopInstance, asgPolicy,
+      incident, attached,
+    };
   } catch (err) {
     // Already open. That is a valid state to proceed from, not a failure:
     // Step Functions retries this task, and an operator may legitimately
@@ -892,29 +944,47 @@ async function caseOpen(event, creds) {
       // A second run under the same id: back to IN_PROGRESS until it
       // finishes, with its targets added to what was requested. Never an
       // incident case's row (kind 'case'); older rows have no kind at all.
-      await ddb.send(new UpdateItemCommand({
-        TableName: CASE_TABLE,
-        Key: { caseId: { S: caseId } },
-        UpdateExpression: 'SET #state = :running, '
-          + 'requestedTargets = list_append(if_not_exists(requestedTargets, :none), :more)',
-        ConditionExpression: 'attribute_not_exists(kind) OR kind = :action',
-        ExpressionAttributeNames: { '#state': 'state' },
-        ExpressionAttributeValues: {
-          ':running': { S: 'IN_PROGRESS' },
-          ':none': { L: [] },
-          ':action': { S: 'action' },
-          ':more': {
-            L: targets.map((t) => ({
-              M: {
-                accountId: { S: String(t.accountId) },
-                instanceId: { S: String(t.instanceId) },
-              },
-            })),
+      //
+      // A run attached to an incident case stays in that case: re-running it
+      // under a DIFFERENT case is refused. Moving it is `fip case move`.
+      try {
+        await ddb.send(new UpdateItemCommand({
+          TableName: CASE_TABLE,
+          Key: { caseId: { S: caseId } },
+          UpdateExpression: 'SET #state = :running, '
+            + 'requestedTargets = list_append(if_not_exists(requestedTargets, :none), :more)'
+            + (incident ? ', incident = :incident' : ''),
+          ConditionExpression: '(attribute_not_exists(kind) OR kind = :action)'
+            + (incident ? ' AND (attribute_not_exists(incident) OR incident = :incident)' : ''),
+          ExpressionAttributeNames: { '#state': 'state' },
+          ExpressionAttributeValues: {
+            ':running': { S: 'IN_PROGRESS' },
+            ':none': { L: [] },
+            ':action': { S: 'action' },
+            ':more': {
+              L: targets.map((t) => ({
+                M: {
+                  accountId: { S: String(t.accountId) },
+                  instanceId: { S: String(t.instanceId) },
+                },
+              })),
+            },
+            ...(incident ? { ':incident': { S: incident } } : {}),
           },
-        },
-      }));
+        }));
+      } catch (inner) {
+        if (inner.name !== 'ConditionalCheckFailedException') throw inner;
+        const existing = await readCaseRow(ddb, caseId);
+        if (existing?.incident?.S && existing.incident.S !== incident) {
+          throw new Error(`isolation run ${caseId} belongs to case ${existing.incident.S}, not ${incident}; `
+            + 'start a new run for this case instead');
+        }
+        throw new Error(`${caseId} is not an isolation run`);
+      }
+      const attached = await attach();
       return {
         caseId, caseState: 'IN_PROGRESS', opened: false, stopInstance, asgPolicy,
+        incident, attached,
         reason: 'case already open',
       };
     }
@@ -1169,6 +1239,11 @@ async function appendCaseEvent({ caseId, event, data, actor }, creds) {
   for (let attempt = 0; attempt < 8; attempt++) {
     const row = await readCaseRow(ddb, caseId);
     if (!row || row.kind?.S !== 'case') throw new Error(`no incident case ${caseId}`);
+    // Re-checked on every attempt, so a case closed between the caller's own
+    // check and this write does not gain a member.
+    if (event === 'MEMBER_ATTACHED' && row.state?.S !== 'OPEN') {
+      throw new Error(`case ${caseId} is ${row.state?.S}; isolations attach only to open cases`);
+    }
     const last = Number(row.logSeq?.N ?? 0);
     const seq = last + 1;
     const prev = last ? { seq: last, key: caseLogKey(caseId, last), sha256: row.logHead?.S } : null;
