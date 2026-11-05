@@ -9,7 +9,7 @@
 # Every row, as one JSON array of items.
 scan_cases() {
     evidence dynamodb scan --table-name fip-cases \
-        --projection-expression 'caseId, kind, #s, openedAt, tickets, logSeq, lastEventAt, targetCount, succeededCount, failedCount' \
+        --projection-expression 'caseId, kind, #s, openedAt, tickets, logSeq, lastEventAt, targetCount, succeededCount, failedCount, mergedInto' \
         --expression-attribute-names '{"#s":"state"}' --output json \
         | jq '.Items'
 }
@@ -21,16 +21,35 @@ get_row() {
         | jq -c '.Item // empty'
 }
 
-# A case named directly, or by a ticket exactly one case carries.
+# A merged case is an alias of the case it merged into. Prints the case an id
+# stands for, saying so when that is a different one.
+follow_alias() {  # $1 = case id
+    local id="$1" row next hops=0
+    case "$id" in case-*) ;; *) printf '%s' "$id"; return ;; esac
+    while :; do
+        row="$(get_row "$id")"
+        [ -n "$row" ] && [ "$(jq -r '.state.S // ""' <<<"$row")" = "MERGED" ] || break
+        next="$(jq -r '.mergedInto.S // ""' <<<"$row")"
+        [ -n "$next" ] || break
+        echo "NOTE: $id was merged into $next; acting on $next." >&2
+        id="$next"; hops=$((hops + 1))
+        [ "$hops" -lt 20 ] || { echo "ERROR: merge chain too long at $id" >&2; exit 1; }
+    done
+    printf '%s' "$id"
+}
+
+# A case named directly, or by a ticket exactly one case carries. A merged
+# case's tickets were copied to the case it merged into, so merged cases are
+# not candidates: the ticket names the survivor.
 resolve() {  # $1 = id or empty, $2 = ticket or empty
     local id="$1" ticket="$2" matches
     if [ -n "$id" ] && [ -n "$ticket" ]; then
         echo "ERROR: name the case or a ticket, not both" >&2; exit 2
     fi
-    if [ -n "$id" ]; then printf '%s' "$id"; return; fi
+    if [ -n "$id" ]; then follow_alias "$id"; return; fi
     [ -n "$ticket" ] || { echo "ERROR: name a case, or --ticket T" >&2; exit 2; }
     matches="$(scan_cases | jq -r --arg t "$ticket" \
-        '[.[] | select(.kind.S == "case" and ((.tickets.SS // []) | index($t)))] | .[].caseId.S')"
+        '[.[] | select(.kind.S == "case" and .state.S != "MERGED" and ((.tickets.SS // []) | index($t)))] | .[].caseId.S')"
     case "$(printf '%s' "$matches" | grep -c . || true)" in
         0) echo "ERROR: no case carries ticket $ticket" >&2; exit 1 ;;
         1) printf '%s' "$matches" ;;

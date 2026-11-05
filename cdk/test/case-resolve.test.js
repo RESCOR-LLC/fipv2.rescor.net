@@ -107,3 +107,38 @@ describe('the open-case notice', () => {
     assert.strictEqual(run('open_cases', [ROWS[2], ROWS[3]]).out, '');
   });
 });
+
+describe('merged cases are aliases', () => {
+  const MERGED = 'case-20261105T090000Z-ffffff';
+  const MERGED2 = 'case-20261105T080000Z-999999';
+  const rows = [
+    ...ROWS,
+    { caseId: { S: MERGED }, kind: { S: 'case' }, state: { S: 'MERGED' }, mergedInto: { S: OPEN_A },
+      openedAt: { S: '2026-11-05T09:00:00Z' }, tickets: { SS: ['INC-1', 'ONLY-MERGED'] } },
+    { caseId: { S: MERGED2 }, kind: { S: 'case' }, state: { S: 'MERGED' }, mergedInto: { S: MERGED },
+      openedAt: { S: '2026-11-05T08:00:00Z' } },
+  ];
+
+  test('naming a merged case acts on the case it merged into, and says so', () => {
+    const r = run(`resolve ${MERGED} ""`, rows);
+    assert.strictEqual(r.out, OPEN_A);
+    assert.match(r.err, new RegExp(`${MERGED} was merged into ${OPEN_A}`));
+  });
+
+  test('a chain of merges is followed to the end', () => {
+    assert.strictEqual(run(`resolve ${MERGED2} ""`, rows).out, OPEN_A);
+  });
+
+  test('a ticket a merged case shares with its survivor names the survivor only', () => {
+    assert.strictEqual(run('resolve "" INC-1', rows).out, OPEN_A);
+  });
+
+  test('isolating into a merged case lands in the survivor', () => {
+    const r = run(`id="$(resolve ${MERGED} "")"; require_open_case "$id"; echo "$id"`, rows);
+    assert.strictEqual(r.out.trim(), OPEN_A);
+  });
+
+  test('a run id is not followed anywhere', () => {
+    assert.strictEqual(run(`resolve ${RUN} ""`, rows).out, RUN);
+  });
+});
