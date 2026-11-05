@@ -31,10 +31,16 @@ import {
   ListGrantsCommand, RetireGrantCommand,
 } from '@aws-sdk/client-kms';
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
-import { DynamoDBClient, PutItemCommand, UpdateItemCommand } from '@aws-sdk/client-dynamodb';
+import {
+  DynamoDBClient, PutItemCommand, UpdateItemCommand, GetItemCommand,
+} from '@aws-sdk/client-dynamodb';
 import { CopySnapshotCommand } from '@aws-sdk/client-ec2';
 import { EBSClient, ListSnapshotBlocksCommand, GetSnapshotBlockCommand } from '@aws-sdk/client-ebs';
 import { createHash, verify as cryptoVerify } from 'node:crypto';
+import {
+  isCaseId, caseLogKey, sha256Hex, checkTicket, checkComment, buildCaseEvent,
+  rowUpdateFor, signedDocument, summarizeAction,
+} from './case-log.mjs';
 
 const REGION = process.env.AWS_REGION;
 const EVIDENCE_ACCOUNT = process.env.FIP_EVIDENCE_ACCOUNT_ID;
@@ -847,6 +853,11 @@ async function caseOpen(event, creds) {
   const asgPolicy = ASG_POLICIES.has(request.asgPolicy)
     ? request.asgPolicy
     : DEFAULT_ASG_POLICY;
+  // An isolation run never writes into an incident case's row: the two
+  // share a table, and a run's targets map would corrupt the case.
+  if (isCaseId(caseId)) {
+    throw new Error(`${caseId} is an incident case, not an isolation id; use --case to attach a run to it`);
+  }
   const ddb = new DynamoDBClient({ region: REGION, credentials: creds });
   const now = new Date().toISOString();
   try {
@@ -854,6 +865,7 @@ async function caseOpen(event, creds) {
       TableName: CASE_TABLE,
       Item: {
         caseId: { S: caseId },
+        kind: { S: 'action' },
         state: { S: 'IN_PROGRESS' },
         openedAt: { S: now },
         openedBy: { S: openedBy ?? 'unknown' },
@@ -877,6 +889,30 @@ async function caseOpen(event, creds) {
     // Step Functions retries this task, and an operator may legitimately
     // re-run a case id after a partial failure.
     if (err.name === 'ConditionalCheckFailedException') {
+      // A second run under the same id: back to IN_PROGRESS until it
+      // finishes, with its targets added to what was requested. Never an
+      // incident case's row (kind 'case'); older rows have no kind at all.
+      await ddb.send(new UpdateItemCommand({
+        TableName: CASE_TABLE,
+        Key: { caseId: { S: caseId } },
+        UpdateExpression: 'SET #state = :running, '
+          + 'requestedTargets = list_append(if_not_exists(requestedTargets, :none), :more)',
+        ConditionExpression: 'attribute_not_exists(kind) OR kind = :action',
+        ExpressionAttributeNames: { '#state': 'state' },
+        ExpressionAttributeValues: {
+          ':running': { S: 'IN_PROGRESS' },
+          ':none': { L: [] },
+          ':action': { S: 'action' },
+          ':more': {
+            L: targets.map((t) => ({
+              M: {
+                accountId: { S: String(t.accountId) },
+                instanceId: { S: String(t.instanceId) },
+              },
+            })),
+          },
+        },
+      }));
       return {
         caseId, caseState: 'IN_PROGRESS', opened: false, stopInstance, asgPolicy,
         reason: 'case already open',
@@ -1036,57 +1072,184 @@ async function releaseToAnalysis(event, creds) {
  */
 async function caseSummary(event, creds) {
   const { caseId, results = [] } = event;
+  const ddb = new DynamoDBClient({ region: REGION, credentials: creds });
 
-  const succeeded = results.filter((r) => r && r.ok === true);
-  const failed = results.filter((r) => !r || r.ok !== true);
-
-  const state = succeeded.length === 0
-    ? 'FAILED'
-    : failed.length === 0 ? 'ACQUIRED' : 'PARTIAL';
+  // The verdict covers every run under this id, not only this one: a second
+  // run with --case-id used to overwrite the first run's outcome.
+  const { Item: row = {} } = await ddb.send(new GetItemCommand({
+    TableName: CASE_TABLE, Key: { caseId: { S: caseId } }, ConsistentRead: true,
+  }));
+  const plain = (m) => Object.fromEntries(Object.entries(m ?? {})
+    .map(([k, v]) => [k, Object.fromEntries(Object.entries(v.M ?? {}).map(([f, x]) => [f, x.S ?? x.N]))]));
+  const summary = summarizeAction({
+    targets: plain(row.targets?.M),
+    previous: (row.failures?.L ?? []).map((f) => plain({ f }).f),
+    results,
+    requested: (row.requestedTargets?.L ?? []).map((t) => plain({ t }).t),
+  });
 
   const now = new Date().toISOString();
-  const ddb = new DynamoDBClient({ region: REGION, credentials: creds });
   await ddb.send(new UpdateItemCommand({
     TableName: CASE_TABLE,
     Key: { caseId: { S: caseId } },
-    UpdateExpression:
-      'SET #state = :state, closedAt = :closedAt, succeededCount = :ok, failedCount = :bad'
-      + (failed.length ? ', failures = :failures' : ''),
+    // completedAt is when the latest run finished. closedAt is kept, with
+    // the same value, for readers written before completedAt existed; a run
+    // finishing never closes anything.
+    UpdateExpression: 'SET #state = :state, completedAt = :now, closedAt = :now, '
+      + 'succeededCount = :ok, failedCount = :bad, targetCount = :count, failures = :failures',
     ExpressionAttributeNames: { '#state': 'state' },
     ExpressionAttributeValues: {
-      ':state': { S: state },
-      ':closedAt': { S: now },
-      ':ok': { N: String(succeeded.length) },
-      ':bad': { N: String(failed.length) },
-      ...(failed.length
-        ? {
-            ':failures': {
-              L: failed.map((f) => ({
-                M: {
-                  accountId: { S: String(f?.accountId ?? 'unknown') },
-                  instanceId: { S: String(f?.instanceId ?? 'unknown') },
-                  error: { S: String(f?.error ?? 'unknown') },
-                  cause: { S: String(f?.cause ?? '').slice(0, 1024) },
-                },
-              })),
-            },
-          }
-        : {}),
+      ':state': { S: summary.state },
+      ':now': { S: now },
+      ':ok': { N: String(summary.succeeded) },
+      ':bad': { N: String(summary.failed) },
+      ':count': { N: String(summary.targetCount) },
+      ':failures': {
+        L: summary.failures.map((f) => ({
+          M: {
+            accountId: { S: f.accountId },
+            instanceId: { S: f.instanceId },
+            error: { S: f.error },
+            cause: { S: f.cause },
+          },
+        })),
+      },
     },
   }));
 
   return {
     caseId,
-    caseState: state,
-    succeeded: succeeded.length,
-    failed: failed.length,
+    caseState: summary.state,
+    succeeded: summary.succeeded,
+    failed: summary.failed,
     closedAt: now,
-    failures: failed.map((f) => ({
-      accountId: f?.accountId ?? null,
-      instanceId: f?.instanceId ?? null,
-      error: f?.error ?? null,
-    })),
+    completedAt: now,
+    failures: summary.failures.map(({ accountId, instanceId, error }) => ({ accountId, instanceId, error })),
   };
+}
+
+/**
+ * ── Incident cases ────────────────────────────────────────────────────
+ * A case is one incident; see case-log.mjs for the log's format and why it
+ * is chained. Its row in fip-cases has kind 'case' and is an index, kept in
+ * step with the log. The log, signed and in the evidence bucket, is the
+ * record: the row can always be rebuilt from it.
+ *
+ * Signing happens here, with the Lambda's own identity, as for manifests.
+ * The CLI never holds the signing permission.
+ */
+async function readCaseRow(ddb, caseId) {
+  const { Item } = await ddb.send(new GetItemCommand({
+    TableName: CASE_TABLE, Key: { caseId: { S: caseId } }, ConsistentRead: true,
+  }));
+  return Item ?? null;
+}
+
+async function applyToRow(ddb, caseId, doc, sha256) {
+  try {
+    await ddb.send(new UpdateItemCommand({
+      TableName: CASE_TABLE, Key: { caseId: { S: caseId } }, ...rowUpdateFor(doc, sha256),
+    }));
+  } catch (err) {
+    // Already at or past this record: someone else applied it, or a later one.
+    if (err.name !== 'ConditionalCheckFailedException') throw err;
+  }
+}
+
+/**
+ * Append one event to a case log, and bring the row up to date. The S3 write
+ * decides the sequence number (If-None-Match), so concurrent writers cannot
+ * both take seq N. A writer that loses reads the winner's record, applies it
+ * to the row if the row has not caught up, and tries again at N+1.
+ */
+async function appendCaseEvent({ caseId, event, data, actor }, creds) {
+  const ddb = new DynamoDBClient({ region: REGION, credentials: creds });
+  const s3 = new S3Client({ region: REGION, credentials: creds });
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const row = await readCaseRow(ddb, caseId);
+    if (!row || row.kind?.S !== 'case') throw new Error(`no incident case ${caseId}`);
+    const last = Number(row.logSeq?.N ?? 0);
+    const seq = last + 1;
+    const prev = last ? { seq: last, key: caseLogKey(caseId, last), sha256: row.logHead?.S } : null;
+    const doc = buildCaseEvent({ caseId, seq, event, at: new Date().toISOString(), actor, prev, data });
+    const envelope = await signEnvelope('caseEvent', doc, 'case-event.json');
+    const key = caseLogKey(caseId, seq);
+    try {
+      await s3.send(new PutObjectCommand({
+        Bucket: EVIDENCE_BUCKET, Key: key,
+        Body: JSON.stringify(envelope, null, 2), ContentType: 'application/json',
+        IfNoneMatch: '*',
+        ...objectLock(),
+      }));
+    } catch (err) {
+      const status = err.$metadata?.httpStatusCode;
+      if (status !== 412 && status !== 409 && err.name !== 'PreconditionFailed') throw err;
+      // Lost the race for seq. The record that won may not be on the row yet.
+      const o = await s3.send(new GetObjectCommand({ Bucket: EVIDENCE_BUCKET, Key: key }));
+      const winner = JSON.parse(await o.Body.transformToString());
+      await applyToRow(ddb, caseId, signedDocument(winner), winner.signature.signedPayloadSha256);
+      continue;
+    }
+    await applyToRow(ddb, caseId, doc, envelope.signature.signedPayloadSha256);
+    return { seq, key, event, at: doc.at };
+  }
+  throw new Error(`case ${caseId}: too many concurrent writers; try again`);
+}
+
+async function caseAction(event, creds) {
+  const { caseId, op, actor = null } = event;
+  if (!isCaseId(caseId)) throw new Error(`'${caseId}' is not an incident case id (case-<UTC>-<hex>)`);
+
+  if (op === 'open') {
+    const tickets = [...new Set((event.tickets ?? []).map(checkTicket))];
+    const comment = checkComment(event.comment);
+    const ddb = new DynamoDBClient({ region: REGION, credentials: creds });
+    const now = new Date().toISOString();
+    try {
+      await ddb.send(new PutItemCommand({
+        TableName: CASE_TABLE,
+        Item: {
+          caseId: { S: caseId },
+          kind: { S: 'case' },
+          state: { S: 'OPEN' },
+          openedAt: { S: now },
+          openedBy: { S: actor ?? 'unknown' },
+          members: { M: {} },
+        },
+        ConditionExpression: 'attribute_not_exists(caseId)',
+      }));
+    } catch (err) {
+      if (err.name === 'ConditionalCheckFailedException') throw new Error(`case ${caseId} already exists`);
+      throw err;
+    }
+    const record = await appendCaseEvent({
+      caseId, event: 'OPENED', actor, data: { tickets, comment },
+    }, creds);
+    return { op, caseState: 'OPEN', tickets, record };
+  }
+
+  if (op === 'ticket') {
+    const ticket = checkTicket(event.ticket);
+    const ddb = new DynamoDBClient({ region: REGION, credentials: creds });
+    const row = await readCaseRow(ddb, caseId);
+    if (!row || row.kind?.S !== 'case') throw new Error(`no incident case ${caseId}`);
+    if (row.state?.S !== 'OPEN') throw new Error(`case ${caseId} is ${row.state?.S}; tickets are added to open cases`);
+    if ((row.tickets?.SS ?? []).includes(ticket)) throw new Error(`case ${caseId} already carries ticket ${ticket}`);
+    const record = await appendCaseEvent({
+      caseId, event: 'TICKET_ADDED', actor, data: { ticket, comment: checkComment(event.comment) },
+    }, creds);
+    return { op, ticket, record };
+  }
+
+  if (op === 'comment') {
+    const record = await appendCaseEvent({
+      caseId, event: 'COMMENT', actor, data: { comment: checkComment(event.comment, { required: true }) },
+    }, creds);
+    return { op, record };
+  }
+
+  throw new Error(`unknown case operation '${op}' (have: open, ticket, comment)`);
 }
 
 // Which credential path each action needs. Member actions assume
@@ -1415,6 +1578,8 @@ const ACTIONS = {
   // member account, so they are exempt from the accountId requirement below.
   caseOpen:    { fn: caseOpen,    creds: 'evidence', caseLevel: true },
   caseSummary: { fn: caseSummary, creds: 'evidence', caseLevel: true },
+  // Incident cases (fip case). Human-initiated only, like release.
+  case:        { fn: caseAction,  creds: 'evidence', caseLevel: true },
   // Chain-of-custody events. Deliberately NOT reachable from the acquisition
   // state machines: evidence is released to an analysis account only when a
   // human asks for it.

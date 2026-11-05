@@ -47,6 +47,9 @@ fip — Forensic Isolation Program
 Usage: fip <command> [options]
 
 Responding to an incident:
+  case open|list|show|ticket|comment   Incident cases: group the isolations of
+                                       an incident still unfolding, with its
+                                       tickets and signed comments.
   instances [--member ID]              List instances in the member accounts,
                                        as targets isolate and restore take.
   isolate <account>:<instance> [...]   Contain and acquire. One case, any number
@@ -170,6 +173,7 @@ case "${1:-}" in
     deploy)   shift; run_script fip-deploy.sh "$@" ;;
     cleanup)  shift; run_script fip-cleanup.sh "$@" ;;
     evidence) shift; run_script fip-evidence.sh "$@" ;;
+    case)     shift; run_script fip-case.sh "$@" ;;
     instances) shift; run_script fip-instances.sh "$@" ;;
     test-instance) shift; run_script fip-test-instance.sh "$@" ;;
     version|--version|-V) cmd_version ;;
