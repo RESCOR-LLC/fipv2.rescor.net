@@ -30,6 +30,7 @@
 set -euo pipefail
 
 CASE_ID=""
+TICKET=""
 ANALYSIS_ACCOUNT=""
 REVOKE="false"
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
@@ -41,7 +42,11 @@ usage() {
 Usage: fip-release.sh --case <case-id> --to <analysis-account-id> [options]
 
 Required:
-  --case ID      The case whose evidence is being released.
+  --case ID      The isolation run (fip-...) or incident case (case-...) whose
+                 evidence is being released. For a case: every member's
+                 evidence, under one KMS grant named for the case; a revoke
+                 also retires the grants of cases merged into it.
+  (or --ticket T, for the incident case that carries ticket T)
   --to ACCOUNT   12-digit analysis account id. May be outside your organization.
 
 Options:
@@ -56,6 +61,7 @@ EOF
 while [ $# -gt 0 ]; do
     case "$1" in
         --case)   CASE_ID="${2:?--case needs a value}"; shift 2 ;;
+        --ticket) TICKET="${2:?--ticket needs a value}"; shift 2 ;;
         --to)     ANALYSIS_ACCOUNT="${2:?--to needs a value}"; shift 2 ;;
         --revoke) REVOKE="true"; shift ;;
         --region) REGION="${2:?--region needs a value}"; shift 2 ;;
@@ -69,6 +75,10 @@ done
 command -v aws >/dev/null 2>&1 || { echo "ERROR: aws CLI not installed" >&2; exit 1; }
 command -v jq  >/dev/null 2>&1 || { echo "ERROR: jq not installed" >&2; exit 1; }
 
+if [ -n "$TICKET" ]; then
+    [ -z "$CASE_ID" ] || { echo "ERROR: name the case or a ticket, not both" >&2; exit 2; }
+    CASE_ID="case-by-ticket"   # resolved below, with the incident-case path
+fi
 [ -n "$CASE_ID" ]          || { echo "ERROR: --case is required" >&2; usage; exit 2; }
 [ -n "$ANALYSIS_ACCOUNT" ] || { echo "ERROR: --to is required" >&2; usage; exit 2; }
 
@@ -79,6 +89,81 @@ fi
 
 ORCHESTRATOR_ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 CALLER_ARN="$(aws sts get-caller-identity --query Arn --output text)"
+
+# ── An incident case ─────────────────────────────────────────────────────
+# Every member's evidence, under one KMS grant named for the case. The
+# Lambda reads the members and their copies itself, so a release cannot
+# reach a host the case does not hold. It plans first; this shows the plan.
+case "$CASE_ID" in case-*)
+    BIN_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    # shellcheck source=fip-case-lib.sh
+    . "$BIN_DIR/fip-case-lib.sh"
+    use_saved_evidence_profile "$REGION"
+    if [ -n "$TICKET" ]; then CASE_ID="$(resolve "" "$TICKET")"; else CASE_ID="$(resolve "$CASE_ID" "")"; fi
+    RESPONSE_FILE="$(mktemp)"
+    trap 'rm -f "$RESPONSE_FILE"' EXIT
+    call() {  # $1 = true for a dry run
+        aws lambda invoke --function-name fip-member-action --region "$REGION" --cli-read-timeout 300 \
+            --payload "$(jq -cn --arg c "$CASE_ID" --arg to "$ANALYSIS_ACCOUNT" --arg actor "$CALLER_ARN" \
+                --argjson revoke "$REVOKE" --argjson dry "$1" \
+                '{action: "release", caseId: $c, analysisAccountId: $to, actor: $actor, revoke: $revoke, dryRun: $dry}' \
+                | base64 | tr -d '\n')" "$RESPONSE_FILE" >/dev/null
+        if jq -e 'has("errorMessage")' "$RESPONSE_FILE" >/dev/null 2>&1; then
+            echo "FAILED. Nothing was recorded." >&2
+            jq -r .errorMessage "$RESPONSE_FILE" >&2
+            exit 1
+        fi
+    }
+    call true
+    echo "Case ............ $CASE_ID  (incident case: every member)"
+    echo "Action .......... $([ "$REVOKE" = true ] && echo REVOKE || echo RELEASE)"
+    echo "Analysis acct ... $ANALYSIS_ACCOUNT"
+    echo "Running as ...... $CALLER_ARN"
+    jq -r '
+      "KMS grant(s) .... " + (.grantNames | join(", ")),
+      "Snapshots ....... \(.snapshots | length)",
+      "",
+      "Members, and who their evidence is shared to now:",
+      (.members[] | "  \(.member)  \(.snapshots | length) snapshot(s)  shared to: "
+          + (if (.sharedTo | length) > 0 then .sharedTo | join(", ") else "nobody" end)),
+      (if (.withoutEvidence | length) > 0 then "", "No evidence copies yet, so not covered:",
+         (.withoutEvidence[] | "  \(.)") else empty end)' "$RESPONSE_FILE"
+    echo
+    if [ "$DRY_RUN" = "true" ]; then echo "DRY RUN: nothing changed."; exit 0; fi
+    if [ "$REVOKE" = "true" ]; then
+        echo "This REMOVES the share from every member's evidence copies and retires the"
+        echo "case's KMS grants for ${ANALYSIS_ACCOUNT}. It does NOT destroy volumes that"
+        echo "account has already created."
+    else
+        echo "This GRANTS ${ANALYSIS_ACCOUNT} the ability to create volumes from every"
+        echo "member's evidence copies and decrypt them. If that account belongs to a third"
+        echo "party, this is the moment evidence leaves your exclusive control. It is"
+        echo "recorded and signed, in the case's log and on each run."
+    fi
+    if [ "$ASSUME_YES" != "true" ]; then
+        printf 'Proceed? [y/N] '
+        read -r reply
+        case "$reply" in y|Y|yes|YES) ;; *) echo "Aborted. Nothing changed." >&2; exit 1 ;; esac
+    fi
+    call false
+    echo
+    jq -r '"Done.",
+      "  Event ........... \(.event)",
+      "  Members ......... \(.members | length)",
+      "  Snapshots ....... \(.snapshots | length)",
+      "  KMS grants ...... " + ((.kmsGrantIds // []) | if length > 0 then join(", ") else "none found" end),
+      "  Custody record .. \(.custodyRecordKey)",
+      "  Case log ........ record \(.record.seq)"' "$RESPONSE_FILE"
+    if [ "$REVOKE" = "true" ]; then
+        echo
+        echo "REMEMBER: volumes that account already created still exist in it."
+    else
+        echo
+        echo "To end this access later:"
+        echo "  fip release --case $CASE_ID --to $ANALYSIS_ACCOUNT --revoke"
+    fi
+    exit 0
+esac
 
 # The evidence copies come from the case row rather than being retyped. Asking
 # an operator to list snapshot ids by hand during an engagement is how the

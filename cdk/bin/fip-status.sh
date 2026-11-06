@@ -32,15 +32,21 @@
 set -euo pipefail
 
 CASE_ID=""
+TICKET=""
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
 WATCH="false"
 INTERVAL=20
 
 usage() {
     cat >&2 <<'EOF'
-Usage: fip status <case-id> [options]
+Usage: fip status <run-id | case-id | --ticket T> [options]
+
+An isolation run (fip-...) shows its targets and copy progress. An incident
+case (case-...) shows every member: acquisition, whether its host is still
+contained, and who its evidence is shared to.
 
 Options:
+  --ticket T       The incident case that carries ticket T.
   --watch          Refresh until the case leaves IN_PROGRESS.
   --interval N     Seconds between refreshes with --watch. Default 20.
   --region R       Default: $AWS_REGION, else us-east-1.
@@ -51,6 +57,7 @@ EOF
 while [ $# -gt 0 ]; do
     case "$1" in
         --watch)    WATCH="true"; shift ;;
+        --ticket)   TICKET="${2:?--ticket needs a value}"; shift 2 ;;
         --interval) INTERVAL="${2:?--interval needs a value}"; shift 2 ;;
         --region)   REGION="${2:?--region needs a value}"; shift 2 ;;
         -h|--help)  usage; exit 0 ;;
@@ -59,10 +66,42 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-[ -n "$CASE_ID" ] || { echo "ERROR: name a case id" >&2; usage; exit 2; }
+[ -n "$CASE_ID" ] || [ -n "$TICKET" ] || { echo "ERROR: name a case id" >&2; usage; exit 2; }
 for tool in aws jq python3; do
     command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: $tool not installed" >&2; exit 1; }
 done
+
+# ── An incident case: every member, wherever its acquisition stands ──────
+# A case holds members of any number of isolation runs. This lists each one
+# with its acquisition, whether its host is still contained (asked of its
+# account, read-only) and who its evidence is shared to. Progress of a run
+# still IN_PROGRESS is `fip status <run id>`.
+BIN_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+case "${CASE_ID:-case-}" in case-*)
+    # shellcheck source=fip-case-lib.sh
+    . "$BIN_DIR/fip-case-lib.sh"
+    use_saved_evidence_profile "$REGION"
+    CASE_ID="$(resolve "$CASE_ID" "$TICKET")"
+    while :; do
+        view="$(case_members "$CASE_ID" true)"
+        echo "Case ............ $CASE_ID"
+        jq -r '"State ........... \(.state)",
+               "Tickets ......... " + (if (.tickets | length) > 0 then .tickets | join(", ") else "none" end),
+               (if (.mergedFrom | length) > 0 then "Merged in ....... " + (.mergedFrom | join(", ")) else empty end),
+               "Members ......... \(.members | length)", ""' <<<"$view"
+        if [ "$(jq '.members | length' <<<"$view")" -gt 0 ]; then
+            print_members <<<"$view"
+            jq -r '.members[] | select(.containmentError) | "  \(.member): containment unknown: \(.containmentError)"' <<<"$view"
+            echo
+            jq -r '[.members[] | select(.acquisition == "IN_PROGRESS") | .actionId] | unique | .[]
+                   | "Still acquiring; for progress: fip status \(.)"' <<<"$view"
+        fi
+        busy="$(jq '[.members[] | select(.acquisition == "IN_PROGRESS")] | length' <<<"$view")"
+        if [ "$WATCH" != "true" ] || [ "$busy" -eq 0 ]; then exit 0; fi
+        sleep "$INTERVAL"
+        echo "────────────────────────────────────────────────────────────"
+    done
+esac
 
 EVIDENCE_ACCOUNT="$(aws lambda get-function-configuration \
     --function-name fip-member-action --region "$REGION" \

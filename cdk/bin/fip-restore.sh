@@ -33,9 +33,14 @@ FUNCTION="fip-member-action"
 usage() {
     cat >&2 <<'EOF'
 Usage: fip restore <account>:<instance> [--dry-run] [--yes] [--region R]
+       fip restore (--case C | --ticket T) [<member>...] [--dry-run] [--yes]
 
 Puts a contained instance back on the security groups it had before FIP
 isolated it. The original groups come from the case's signed manifest.
+
+With --case, every member of the incident case whose host is still
+contained, or only the members named (fip-.../i-... or i-...). All plans
+are shown first and one confirmation covers them.
 
 Run it with ORCHESTRATOR credentials, for example
 
@@ -52,17 +57,86 @@ undo each one, but not undone.
 EOF
 }
 
+INCIDENT=""
+INCIDENT_TICKET=""
+NAMED=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN="true"; shift ;;
         --yes|-y)  ASSUME_YES="true"; shift ;;
         --region)  REGION="${2:?--region needs a value}"; shift 2 ;;
+        --case)    INCIDENT="${2:?--case needs a case id}"; shift 2 ;;
+        --ticket)  INCIDENT_TICKET="${2:?--ticket needs a value}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         -*) echo "ERROR: unknown option '$1'" >&2; usage; exit 2 ;;
-        *)  [ -z "$TARGET" ] || { echo "ERROR: restore one instance at a time" >&2; exit 2; }
-            TARGET="$1"; shift ;;
+        *)  NAMED+=("$1"); shift ;;
     esac
 done
+
+# ── A whole incident case ────────────────────────────────────────────────
+# Every member whose host is still contained, or only the members named
+# (as fip-.../i-... or i-...). Each is planned and shown first; one
+# confirmation covers them all; then each is restored exactly as a single
+# `fip restore` would, with its own signed custody record.
+if [ -n "$INCIDENT" ] || [ -n "$INCIDENT_TICKET" ]; then
+    BIN_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    # shellcheck source=fip-case-lib.sh
+    . "$BIN_DIR/fip-case-lib.sh"
+    use_saved_evidence_profile "$REGION"
+    INCIDENT="$(resolve "$INCIDENT" "$INCIDENT_TICKET")"
+    case "$INCIDENT" in case-*) ;; *) echo "ERROR: --case takes an incident case (case-...)" >&2; exit 2 ;; esac
+    echo "Case ............ $INCIDENT"
+    echo "Asking each member account whether its host is still contained..."
+    VIEW="$(case_members "$INCIDENT" true)"
+    print_members <<<"$VIEW"
+    echo
+    PICK="$(jq -c --args '
+        ($ARGS.positional) as $named
+        | [.members[] | select(. as $m | ($named | length) == 0
+              or ($named | index($m.member)) or ($named | index($m.instanceId)))]' "${NAMED[@]+"${NAMED[@]}"}" <<<"$VIEW")"
+    if [ "${#NAMED[@]}" -gt 0 ] && [ "$(jq length <<<"$PICK")" -ne "${#NAMED[@]}" ]; then
+        echo "ERROR: not every name given is a member of $INCIDENT (members are listed above)" >&2
+        exit 2
+    fi
+    UNKNOWN="$(jq -r '.[] | select(.contained == null) | "  \(.member): \(.containmentError // "unknown")"' <<<"$PICK")"
+    [ -z "$UNKNOWN" ] || { echo "Could not check (left alone):"; echo "$UNKNOWN"; echo; }
+    TARGETS="$(jq -r '.[] | select(.contained == true) | "\(.accountId):\(.instanceId)"' <<<"$PICK")"
+    if [ -z "$TARGETS" ]; then
+        echo "Nothing to restore: no member named is still contained."
+        exit 0
+    fi
+    echo "Plans:"
+    while IFS= read -r t; do
+        echo "── $t"
+        "$0" "$t" --dry-run --region "$REGION" || true
+    done <<<"$TARGETS"
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "DRY RUN: nothing changed."
+        exit 0
+    fi
+    echo "This reconnects $(grep -c . <<<"$TARGETS") host(s) to their original network access. If any is"
+    echo "still compromised, it can reach out again as soon as this runs. Each is recorded"
+    echo "as a signed custody event."
+    if [ "$ASSUME_YES" != "true" ]; then
+        printf 'Proceed? [y/N] '
+        read -r reply
+        case "$reply" in y|Y|yes|YES) ;; *) echo "Aborted. Nothing was changed." >&2; exit 1 ;; esac
+    fi
+    FAILED=0
+    while IFS= read -r t; do
+        echo "── $t"
+        "$0" "$t" --yes --region "$REGION" || FAILED=$((FAILED + 1))
+    done <<<"$TARGETS"
+    if [ "$FAILED" -gt 0 ]; then
+        echo "$FAILED host(s) were not fully restored; see above. fip status $INCIDENT" >&2
+        exit 1
+    fi
+    echo "Every contained member named is restored. fip status $INCIDENT"
+    exit 0
+fi
+
+[ "${#NAMED[@]}" -le 1 ] || { echo "ERROR: restore one instance at a time, or use --case" >&2; exit 2; }
+TARGET="${NAMED[0]:-}"
 
 [ -n "$TARGET" ] || { echo "ERROR: name the instance as <account-id>:<instance-id>" >&2; usage; exit 2; }
 ACCOUNT="${TARGET%%:*}"

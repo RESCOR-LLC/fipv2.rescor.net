@@ -28,6 +28,8 @@ Usage:
   fip case comment <case | --ticket T> C
   fip case move    <member>... (--to <case> | --ticket T) --comment C
   fip case merge   <into> <from>... --comment C
+  fip case close   <case | --ticket T> --comment C [--force]
+  fip case reopen  <case | --ticket T> --comment C
 
 An incident case groups the isolations of one incident, with its tickets and
 comments. Use one when the incident is still unfolding; for a known, single
@@ -47,6 +49,10 @@ isolation, `fip isolate` alone is enough (manual §5.1).
   merge     Move every member of each <from> case into <into>; each <from>
             becomes an alias of <into>, and its tickets are copied across.
             There is no unmerge: move the members back instead.
+  close     Close the incident. Refused while any member's host is still
+            contained or its evidence is shared to an analysis account;
+            --force overrides, and records what it overrode. Deletes nothing.
+  reopen    Open a closed case again.
 
 Wherever a case is named, --ticket T also works if exactly one case carries
 that ticket. Naming a merged case acts on the case it merged into, and says so.
@@ -80,7 +86,7 @@ evidence()     { aws --profile "$EVIDENCE_PROFILE" --region "$REGION" "$@"; }
 # ── Writes, through the Lambda ───────────────────────────────────────────
 invoke() {  # $1 = JSON payload
     local response="$WORK_DIR/response.json"
-    orchestrator lambda invoke --function-name "$FUNCTION" --cli-read-timeout 120 \
+    orchestrator lambda invoke --function-name "$FUNCTION" --cli-read-timeout 600 \
         --payload "$(printf '%s' "$1" | base64 | tr -d '\n')" "$response" >/dev/null
     if jq -e 'has("errorMessage")' "$response" >/dev/null 2>&1; then
         echo "ERROR: $(jq -r .errorMessage "$response")" >&2
@@ -210,10 +216,15 @@ cmd_show() {
       "Opened .......... \(.openedAt.S // "?")  by \(.openedBy.S // "?")",
       "Tickets ......... " + ((.tickets.SS // []) | if length > 0 then join(", ") else "none" end),
       (if .mergedFrom then "Merged in ....... " + (.mergedFrom.SS | join(", ")) else empty end),
-      "Members ......... " + ((.members.M // {}) | length | tostring),
-      ((.members.M // {}) | to_entries | sort_by(.key)[]
-        | "  \(.key)  account \(.value.M.accountId.S // "?")")
+      (if .closedAt then "Closed .......... \(.closedAt.S)  by \(.closedBy.S // "?")" else empty end),
+      "Members ......... " + ((.members.M // {}) | length | tostring)
     ' <<<"$row"
+    if [ "$(jq '(.members.M // {}) | length' <<<"$row")" -gt 0 ]; then
+        # Release state is per member: it follows the evidence, whichever case
+        # the release was made under. Containment: fip status <case>.
+        echo
+        case_members "$id" false | print_members | sed 's/^/  /'
+    fi
     echo
     echo "Timeline:"
     jq -r --arg id "$id" '
@@ -233,6 +244,10 @@ cmd_show() {
            (if .mergedInto then "  into \(.mergedInto); this case is now its alias"
             else "  absorbed \(.absorbed)" + (if ((.tickets // []) | length) > 0 then ", tickets \(.tickets | join(", "))" else "" end) end)
          else "" end)
+      + (if .event == "RELEASED" or .event == "REVOKED" then
+           "  \(if .event == "RELEASED" then "to" else "from" end) \(.analysisAccountId): \(.snapshots | length) snapshot(s) of \(.members | length) member(s)"
+         else "" end)
+      + (if .event == "CLOSED" and .forced then "  FORCED, overriding:" + ((.overridden // []) | map("\n        " + .) | join("")) else "" end)
       + (if .event == "ABORTED" then "  withdraws record \(.aborts.seq) (\(.aborts.event // "?"))\n        \(.reason // "")" else "" end)
       + (if .comment then "\n        \(.comment)" else "" end)
       + "\n        by \(.actor // "?")"
@@ -342,8 +357,40 @@ cmd_merge() {
     echo "Each merged case is now an alias of $into. fip case show $into"
 }
 
+cmd_close_or_reopen() {  # $1 = close | reopen
+    local op="$1"; shift
+    local id="" by="" comment="" force=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --ticket)  by="${2:?--ticket needs a value}"; shift 2 ;;
+            --comment) comment="${2:?--comment needs text}"; shift 2 ;;
+            --force)   [ "$op" = close ] || { echo "ERROR: --force is for close" >&2; exit 2; }; force=true; shift ;;
+            -*) echo "ERROR: unknown option '$1'" >&2; usage; exit 2 ;;
+            *) [ -z "$id" ] || { echo "ERROR: one case at a time" >&2; exit 2; }; id="$1"; shift ;;
+        esac
+    done
+    [ -n "$comment" ] || { echo "ERROR: --comment is required: it is part of the record" >&2; exit 2; }
+    id="$(resolve "$id" "$by")"
+    [ "$op" = reopen ] || echo "Checking every member: is its host still contained, is its evidence shared..."
+    local result
+    result="$(invoke "$(jq -cn --arg id "$id" --arg op "$op" --arg actor "$(actor)" --arg c "$comment" --argjson f "$force" \
+        '{action: "case", op: $op, caseId: $id, actor: $actor, comment: $c, force: $f}')")"
+    if [ "$op" = reopen ]; then
+        echo "Case $id is OPEN again (record $(jq -r .record.seq <<<"$result"))."
+        return
+    fi
+    echo "Case $id is CLOSED (record $(jq -r .record.seq <<<"$result")). Nothing was deleted;"
+    echo "retention still decides how long its evidence is kept."
+    if jq -e .forced <<<"$result" >/dev/null; then
+        echo "FORCED. What was overridden is recorded with it:"
+        jq -r '.overridden[] | "  " + .' <<<"$result"
+    fi
+}
+
 case "$VERB" in
     open)    cmd_open "$@" ;;
+    close)   cmd_close_or_reopen close "$@" ;;
+    reopen)  cmd_close_or_reopen reopen "$@" ;;
     move)    cmd_move "$@" ;;
     merge)   cmd_merge "$@" ;;
     list)    cmd_list "$@" ;;

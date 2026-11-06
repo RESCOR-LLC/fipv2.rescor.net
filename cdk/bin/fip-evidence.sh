@@ -18,15 +18,20 @@ set -euo pipefail
 CONFIG_FILE="${FIP_CONFIG:-$HOME/.fip/install.env}"
 BIN_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CASE_ID=""
+TICKET=""
 OUT=""
 
 usage() {
     cat >&2 <<'EOF'
-Usage: fip evidence <case-id> [--out DIR]
+Usage: fip evidence <run-id | case-id | --ticket T> [--out DIR]
 
 Downloads the case's manifests and custody records from the evidence bucket,
 and verifies each one: unchanged since it was signed, and signed by this
 installation's key. Changes nothing in AWS.
+
+For an incident case (case-...): its log and custody records, and every
+member's manifest and run custody records; the log is also checked as a
+chain, so a missing or reordered record fails.
 
   --out DIR   Where to put them. Default: ./<case-id>
 EOF
@@ -35,15 +40,14 @@ EOF
 while [ $# -gt 0 ]; do
     case "$1" in
         --out) OUT="${2:?--out needs a directory}"; shift 2 ;;
+        --ticket) TICKET="${2:?--ticket needs a value}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         -*) echo "ERROR: unknown option '$1'" >&2; usage; exit 2 ;;
         *) [ -z "$CASE_ID" ] || { echo "ERROR: one case at a time" >&2; exit 2; }
            CASE_ID="$1"; shift ;;
     esac
 done
-[ -n "$CASE_ID" ] || { echo "ERROR: name the case id" >&2; usage; exit 2; }
-case "$CASE_ID" in */*|*..*) echo "ERROR: '$CASE_ID' is not a case id" >&2; exit 2 ;; esac
-OUT="${OUT:-./$CASE_ID}"
+[ -n "$CASE_ID" ] || [ -n "$TICKET" ] || { echo "ERROR: name the case id" >&2; usage; exit 2; }
 
 [ -f "$CONFIG_FILE" ] || { echo "ERROR: no configuration at $CONFIG_FILE. Run: fip configure" >&2; exit 1; }
 # shellcheck disable=SC1090
@@ -53,6 +57,15 @@ ORCH_PROFILE="${FIP_ORCHESTRATOR_PROFILE:-fip-orchestrator}"
 EVID_PROFILE="${FIP_EVIDENCE_PROFILE:-fip-evidence}"
 BUCKET="fip-evidence-${FIP_EVIDENCE_ACCOUNT_ID:?missing from $CONFIG_FILE}-$REGION"
 
+# Incident cases are named by id or ticket; a merged one stands for the case
+# it merged into.
+evidence() { aws --profile "$EVID_PROFILE" --region "$REGION" "$@"; }
+# shellcheck source=fip-case-lib.sh
+. "$BIN_DIR/fip-case-lib.sh"
+case "${CASE_ID:-case-}" in case-*) CASE_ID="$(resolve "$CASE_ID" "$TICKET")" ;; esac
+case "$CASE_ID" in */*|*..*) echo "ERROR: '$CASE_ID' is not a case id" >&2; exit 2 ;; esac
+OUT="${OUT:-./$CASE_ID}"
+
 KEY_ARN="$(aws cloudformation describe-stacks --profile "$ORCH_PROFILE" --region "$REGION" \
     --stack-name FipOrchestratorStack \
     --query "Stacks[0].Outputs[?OutputKey=='ManifestSigningKeyArn'].OutputValue" --output text)"
@@ -61,10 +74,57 @@ case "$KEY_ARN" in arn:*) ;; *)
     exit 1 ;;
 esac
 
-echo "Case $CASE_ID, from s3://$BUCKET/cases/$CASE_ID/"
-mkdir -p "$OUT"
-aws s3 cp --profile "$EVID_PROFILE" --region "$REGION" --recursive --only-show-errors \
-    "s3://$BUCKET/cases/$CASE_ID/" "$OUT/"
+fetch() {  # $1 = prefix under cases/, $2 = local directory
+    mkdir -p "$2"
+    aws s3 cp --profile "$EVID_PROFILE" --region "$REGION" --recursive --only-show-errors \
+        "s3://$BUCKET/cases/$1" "$2/"
+}
+
+CHAIN_OK=true
+case "$CASE_ID" in
+case-*)
+    # An incident case: its own log and custody records, and for every
+    # member, that member's manifest and its run's custody records. The
+    # members are read from the case row; the log is then checked as a chain
+    # as well as record by record, so a deleted or reordered record shows.
+    echo "Incident case $CASE_ID"
+    fetch "$CASE_ID/" "$OUT/case"
+    ROW="$(get_row "$CASE_ID")"
+    MEMBERS="$(jq -r '(.members.M // {}) | to_entries[] | "\(.value.M.actionId.S) \(.value.M.instanceId.S)"' <<<"$ROW")"
+    echo "Members ......... $(grep -c . <<<"$MEMBERS" || true)"
+    SEEN_RUNS=" "
+    while read -r run instance; do
+        [ -n "$run" ] || continue
+        echo "  $run/$instance"
+        fetch "$run/$instance/" "$OUT/members/$run/$instance"
+        case "$SEEN_RUNS" in *" $run "*) ;; *)
+            fetch "$run/custody/" "$OUT/members/$run/custody"
+            SEEN_RUNS="$SEEN_RUNS$run " ;;
+        esac
+    done <<<"$MEMBERS"
+    echo
+    echo "Case log chain:"
+    aws kms get-public-key --profile "$ORCH_PROFILE" --region "$REGION" --key-id "$KEY_ARN" \
+        --query PublicKey --output text | base64 -d > "$OUT/.signing-key.der"
+    node "$BIN_DIR/fip-case-log.mjs" "$CASE_ID" "$OUT/case/log" "$OUT/.signing-key.der" > "$OUT/.log-check.json"
+    rm -f "$OUT/.signing-key.der"
+    LOGGED="$(jq -r '.logSeq.N // "0"' <<<"$ROW")"
+    FOUND="$(jq '.records | length' "$OUT/.log-check.json")"
+    if jq -e .ok "$OUT/.log-check.json" >/dev/null && [ "$FOUND" -ge "$LOGGED" ]; then
+        echo "  ok    $FOUND record(s), chained from OPENED, none missing or out of order"
+    else
+        CHAIN_OK=false
+        jq -r '.problems[] | "  FAIL  " + .' "$OUT/.log-check.json" >&2
+        [ "$FOUND" -ge "$LOGGED" ] || echo "  FAIL  the case table records $LOGGED record(s), but $FOUND are in the bucket" >&2
+    fi
+    rm -f "$OUT/.log-check.json"
+    echo
+    ;;
+*)
+    echo "Case $CASE_ID, from s3://$BUCKET/cases/$CASE_ID/"
+    fetch "$CASE_ID/" "$OUT"
+    ;;
+esac
 
 FILES=()
 while IFS= read -r f; do FILES+=("$f"); done < <(find "$OUT" -type f -name '*.json' | sort)
@@ -89,6 +149,11 @@ done
 echo
 if [ "$BAD" -gt 0 ]; then
     echo "$BAD of ${#FILES[@]} record(s) did NOT verify. Treat them as untrusted." >&2
+    exit 1
+fi
+if [ "$CHAIN_OK" != "true" ]; then
+    echo "Every record verifies on its own, but the case log's chain does NOT. Records are" >&2
+    echo "missing or out of order; treat the case log as incomplete." >&2
     exit 1
 fi
 echo "All ${#FILES[@]} record(s) verified: unchanged, and signed by this installation."
