@@ -91,8 +91,17 @@ ALLOW_RESTORE="${FIP_ALLOW_RESTORE:-Yes}"
 export AWS_REGION="$REGION" FIP_ORCHESTRATOR_ACCOUNT_ID FIP_EVIDENCE_ACCOUNT_ID
 export FIP_ANALYSIS_ACCOUNT_ID="${FIP_ANALYSIS_ACCOUNT_ID:-}"
 
+# The organization is a choice that must be made, not a value that may be
+# missing: an id, or "none" for an install with no organization. A blank one
+# once let member roles deploy without their aws:PrincipalOrgID condition.
+case "${FIP_ORG_ID:-}" in
+    o-*|none) ;;
+    *) echo "ERROR: no organization in $CONFIG_FILE (FIP_ORG_ID='${FIP_ORG_ID:-}')." >&2
+       echo "       Rerun: fip configure --org-id o-...   or, with no AWS Organization: fip configure --no-org" >&2
+       exit 1 ;;
+esac
 ORG_CONTEXT=()
-[ -z "${FIP_ORG_ID:-}" ] || ORG_CONTEXT=(--context "fip:orgId=$FIP_ORG_ID")
+[ "$FIP_ORG_ID" = "none" ] || ORG_CONTEXT=(--context "fip:orgId=$FIP_ORG_ID")
 APPROVAL=()
 [ "$ASSUME_YES" != "true" ] || APPROVAL=(--require-approval never)
 
@@ -116,7 +125,9 @@ ok()    { echo "  ok    $*"; }
 fail()  { echo "  FAIL  $*" >&2; exit 1; }
 want()  { [ -z "$ONLY" ] || [ "$ONLY" = "$1" ]; }
 run()   {  # print, then run unless dry-run
-    echo "  \$ $*"
+    # The external ID is visible in the role's trust policy, but a deploy log
+    # gets pasted into tickets and chats, so it is not echoed here.
+    echo "  \$ $*" | sed -E 's/(ExternalId=)[^ ]+/\1(hidden)/g'
     [ "$DRY_RUN" = "true" ] || "$@"
 }
 account_of() { aws sts get-caller-identity --profile "$1" --query Account --output text 2>/dev/null || true; }
@@ -166,7 +177,7 @@ echo "  Evidence ......... $FIP_EVIDENCE_ACCOUNT_ID ($EVID_PROFILE)"
 member_list=""
 for m in "${MEMBERS[@]}"; do member_list="$member_list ${m%%=*} (${m#*=})"; done
 echo "  Members ..........${member_list}"
-echo "  Organization ..... ${FIP_ORG_ID:-none}"
+echo "  Organization ..... $FIP_ORG_ID"
 echo "  Analysis ......... ${FIP_ANALYSIS_ACCOUNT_ID:-none}"
 echo "  Responder role ... $RESPONDER    Restore allowed ... $ALLOW_RESTORE"
 if [ "$PRODUCTION" = "true" ]; then
@@ -310,6 +321,7 @@ if want members; then
                 "OrchestratorAccountId=$FIP_ORCHESTRATOR_ACCOUNT_ID" \
                 "EvidenceAccountId=$FIP_EVIDENCE_ACCOUNT_ID" \
                 "ExternalId=$external_id" \
+                "OrganizationId=$FIP_ORG_ID" \
                 "DeployResponderRole=$RESPONDER" \
                 ${RESTORE_PARAM[@]+"${RESTORE_PARAM[@]}"} \
             --tags "${MEMBER_TAGS[@]}"
@@ -327,6 +339,16 @@ if want members; then
         ok "$role refuses a wrong external ID"
         if assume; then fail "$role ACCEPTS no external ID. Do not use this account."; fi
         ok "$role refuses a missing external ID"
+        # The organization condition, read back from every FIP role's trust
+        # policy: present and right with an organization, absent with none.
+        for r in FipInventoryRole FipResponderRole; do
+            trust="$(aws iam get-role --profile "$profile" --role-name "$r" \
+                --query 'Role.AssumeRolePolicyDocument' --output json 2>/dev/null)" || continue
+            got="$(jq -r '[.Statement[].Condition.StringEquals["aws:PrincipalOrgID"] // "none"] | unique | join(",")' <<<"$trust")"
+            [ "$got" = "$FIP_ORG_ID" ] || fail "$r trust has aws:PrincipalOrgID '$got', expected '$FIP_ORG_ID'"
+            if [ "$FIP_ORG_ID" = "none" ]; then ok "$r trust: no organization condition (none configured)"
+            else ok "$r trust requires organization $FIP_ORG_ID"; fi
+        done
     done
 fi
 

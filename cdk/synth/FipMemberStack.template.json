@@ -19,6 +19,12 @@
    "ConstraintDescription": "At least 16 characters, alphanumeric plus + = , . @ : / - and no spaces.",
    "Description": "Unpredictable per-account identifier issued by the FIP orchestrator operator, required on sts:AssumeRole. Not a secret — it is visible in this role trust policy. Do not invent your own value; use the one you were issued, or the confused-deputy protection it provides is void."
   },
+  "OrganizationId": {
+   "Type": "String",
+   "AllowedPattern": "^(o-[a-z0-9]{10,32}|none)$",
+   "ConstraintDescription": "An organization id (o-...), or the word none.",
+   "Description": "Your AWS Organizations id (o-...), required of the orchestrator as aws:PrincipalOrgID on every assume. The word none only if you have no organization."
+  },
   "DeployResponderRole": {
    "Type": "String",
    "Default": "Yes",
@@ -38,6 +44,43 @@
    "Description": "Let FIP restore a contained instance to its original security groups (fip restore). No keeps restore a manual step with this account's own credentials."
   }
  },
+ "Conditions": {
+  "HasOrganization": {
+   "Fn::Not": [
+    {
+     "Fn::Equals": [
+      {
+       "Ref": "OrganizationId"
+      },
+      "none"
+     ]
+    }
+   ]
+  },
+  "ResponderEnabled": {
+   "Fn::Equals": [
+    {
+     "Ref": "DeployResponderRole"
+    },
+    "Yes"
+   ]
+  },
+  "RestoreEnabled": {
+   "Fn::And": [
+    {
+     "Condition": "ResponderEnabled"
+    },
+    {
+     "Fn::Equals": [
+      {
+       "Ref": "AllowRestore"
+      },
+      "Yes"
+     ]
+    }
+   ]
+  }
+ },
  "Resources": {
   "FipInventoryRole33FBE6B1": {
    "Type": "AWS::IAM::Role",
@@ -50,6 +93,17 @@
         "StringEquals": {
          "sts:ExternalId": {
           "Ref": "ExternalId"
+         },
+         "aws:PrincipalOrgID": {
+          "Fn::If": [
+           "HasOrganization",
+           {
+            "Ref": "OrganizationId"
+           },
+           {
+            "Ref": "AWS::NoValue"
+           }
+          ]
          }
         }
        },
@@ -252,6 +306,17 @@
         "StringEquals": {
          "sts:ExternalId": {
           "Ref": "ExternalId"
+         },
+         "aws:PrincipalOrgID": {
+          "Fn::If": [
+           "HasOrganization",
+           {
+            "Ref": "OrganizationId"
+           },
+           {
+            "Ref": "AWS::NoValue"
+           }
+          ]
          }
         }
        },
@@ -810,31 +875,6 @@
     ]
    },
    "Condition": "ResponderEnabled"
-  }
- },
- "Conditions": {
-  "ResponderEnabled": {
-   "Fn::Equals": [
-    {
-     "Ref": "DeployResponderRole"
-    },
-    "Yes"
-   ]
-  },
-  "RestoreEnabled": {
-   "Fn::And": [
-    {
-     "Condition": "ResponderEnabled"
-    },
-    {
-     "Fn::Equals": [
-      {
-       "Ref": "AllowRestore"
-      },
-      "Yes"
-     ]
-    }
-   ]
   }
  }
 }

@@ -117,7 +117,7 @@ while [ $# -gt 0 ]; do
         --analysis)      ANALYSIS="${2:?--analysis needs an account id}"; ANALYSIS_GIVEN="true"; shift 2 ;;
         --no-analysis)   ANALYSIS=""; ANALYSIS_GIVEN="true"; shift ;;
         --org-id)        ORG="${2:?--org-id needs a value}"; ORG_GIVEN="true"; shift 2 ;;
-        --no-org)        ORG=""; ORG_GIVEN="true"; shift ;;
+        --no-org)        ORG="none"; ORG_GIVEN="true"; shift ;;
         --admin-role)    ADMIN_ROLE="${2:?--admin-role needs a role name}"; shift 2 ;;
         --source-profile) SOURCE_PROFILE="${2:?--source-profile needs a name}"; shift 2 ;;
         --orchestrator-profile) ORCH_PROFILE="${2:?needs a profile}"; shift 2 ;;
@@ -224,11 +224,15 @@ ask REGION "AWS region" "$REGION"
 
 ORG_ACCOUNTS=""
 if aws sts get-caller-identity --profile "$SOURCE_PROFILE" >/dev/null 2>&1; then
+    ORG_ERR="$(mktemp)"
     LOOKED_UP_ORG="$(aws organizations describe-organization --profile "$SOURCE_PROFILE" \
-        --query Organization.Id --output text 2>/dev/null || true)"
+        --query Organization.Id --output text 2>"$ORG_ERR" || true)"
+    # Not in an organization is an answer ("none"); a lookup that failed is
+    # not, and leaves the organization blank so fip deploy stops and asks.
+    grep -q AWSOrganizationsNotInUseException "$ORG_ERR" && LOOKED_UP_ORG="none"
+    rm -f "$ORG_ERR"
     if [ "$ORG_GIVEN" != "true" ]; then
-        ORG="${LOOKED_UP_ORG:-}"
-        [ "$ORG" != "None" ] || ORG=""
+        case "$LOOKED_UP_ORG" in o-*|none) ORG="$LOOKED_UP_ORG" ;; *) ;; esac
     fi
     ORG_ACCOUNTS="$(aws organizations list-accounts --profile "$SOURCE_PROFILE" \
         --query "Accounts[?Status=='ACTIVE'].[Id,Name]" --output text 2>/dev/null || true)"
@@ -236,7 +240,12 @@ else
     echo "WARN  profile '$SOURCE_PROFILE' has no working credentials, so nothing can be"
     echo "      looked up. Sign in with it first, or pass --source-profile."
 fi
-echo "Organization .... ${ORG:-none}"
+if [ -n "$ORG" ]; then
+    echo "Organization .... $ORG"
+else
+    echo "WARN  Organization: unknown. The lookup failed, so fip deploy will stop until you"
+    echo "      choose: --org-id o-...   or, with no AWS Organization, --no-org"
+fi
 
 if [ -n "$ORG_ACCOUNTS" ] && [ "$ASSUME_YES" != "true" ]; then
     echo

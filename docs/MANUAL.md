@@ -504,7 +504,7 @@ saved is offered as the default.
 | `--orchestrator ID`, `--evidence ID` | The two central accounts. They may be the same |
 | `--member ID[=PROFILE]` | An account FIP covers. Repeatable. `=PROFILE` names an existing profile for it |
 | `--analysis ID` / `--no-analysis` | The optional account where examiners work (§10) |
-| `--org-id ID` / `--no-org` | Your AWS Organizations id. Looked up if omitted |
+| `--org-id ID` / `--no-org` | Your AWS Organizations id, or `--no-org` if you have none. Looked up if omitted; if the lookup fails, `fip deploy` stops until you give one of the two |
 | `--admin-role NAME` | The role FIP's profiles assume in each account. Default `AWSControlTowerExecution`; accounts made by AWS Organizations usually have `OrganizationAccountAccessRole` |
 | `--source-profile NAME` | Credentials those profiles start from. Default `default` |
 | `--orchestrator-profile P`, `--evidence-profile P` | Use an existing profile rather than create one |
@@ -573,6 +573,14 @@ must remain, because CDK cannot create roles without it.
 **Member accounts you don't deploy to yourself.** The member template,
 `cdk/synth/FipMemberStack.template.json`, needs no bootstrap and can be deployed as
 a StackSet. Appendix A.5 gives its parameters.
+
+**The organization is checked.** It stops before changing anything unless
+`~/.fip/install.env` names an organization id or `none`. After deploying each member it
+reads back every FIP role's trust policy and fails unless `aws:PrincipalOrgID` matches.
+Installs configured before this check, with no organization recorded, stop once: rerun
+`fip configure --org-id o-…` or `fip configure --no-org`, then `fip deploy`. Member
+stacks deployed before then lack the organization condition even where one was
+configured; `fip deploy --only members` adds it.
 
 By hand: [Appendix A.3](#a3-bootstrap-and-deploy-the-two-central-stacks) to
 [A.5](#a5-deploy-the-member-stack).
@@ -1462,14 +1470,19 @@ accounts named `FIP Orchestrator` and `FIP Evidence`; set
 source ./bin/discover-accounts.sh
 ```
 
-**Your organization id, looked up rather than typed.** It is empty if you have no
-organization, and every later command copes with that:
+**Your organization id, looked up rather than typed.** It must end up as an id
+(`o-…`) or, if you have no AWS Organization, the word `none`. Never leave it empty:
+the member stack refuses to deploy without it.
 
 ```sh
 export FIP_ORG_ID=$(aws organizations describe-organization \
-  --query Organization.Id --output text 2>/dev/null)
-echo "organization: ${FIP_ORG_ID:-none}"
+  --query Organization.Id --output text)
+echo "organization: $FIP_ORG_ID"
 ```
+
+If the lookup fails with `AWSOrganizationsNotInUseException`, you have no organization:
+`export FIP_ORG_ID=none`. Any other failure is a credentials problem; fix it rather than
+writing `none`, which would drop a trust condition you are entitled to.
 
 **The profiles.** One per account. **If you already have a profile that reaches an
 account with the access FIP needs, use it**: set the matching variable below to its name,
@@ -1587,12 +1600,13 @@ Each account is bootstrapped and deployed with **its own** profile (§2):
 npx cdk bootstrap aws://$FIP_EVIDENCE_ACCOUNT_ID/$AWS_REGION     --profile $FIP_EVIDENCE_PROFILE
 npx cdk bootstrap aws://$FIP_ORCHESTRATOR_ACCOUNT_ID/$AWS_REGION --profile $FIP_ORCHESTRATOR_PROFILE
 
-npx cdk deploy FipCoreStack         --profile $FIP_EVIDENCE_PROFILE     ${FIP_ORG_ID:+--context=fip:orgId=$FIP_ORG_ID}
-npx cdk deploy FipOrchestratorStack --profile $FIP_ORCHESTRATOR_PROFILE ${FIP_ORG_ID:+--context=fip:orgId=$FIP_ORG_ID}
+ORG_CONTEXT="--context=fip:orgId=$FIP_ORG_ID"; [ "$FIP_ORG_ID" != none ] || ORG_CONTEXT=""
+npx cdk deploy FipCoreStack         --profile $FIP_EVIDENCE_PROFILE     $ORG_CONTEXT
+npx cdk deploy FipOrchestratorStack --profile $FIP_ORCHESTRATOR_PROFILE $ORG_CONTEXT
 ```
 
-The `${FIP_ORG_ID:+…}` part passes your organization id when you have one, and nothing
-when you do not.
+`ORG_CONTEXT` passes your organization id when you have one, and nothing when it is
+`none`.
 
 Both stacks carry the product tags `application=fipv2`, `fip:class` and `fip:component`
 from the code (§11). `fip deploy` also adds `fip:environment` and your own tags. To add
@@ -1707,6 +1721,7 @@ aws cloudformation deploy --profile $FIP_MEMBER_PROFILE \
       OrchestratorAccountId=$FIP_ORCHESTRATOR_ACCOUNT_ID \
       EvidenceAccountId=$FIP_EVIDENCE_ACCOUNT_ID \
       ExternalId="$EXTERNAL_ID" \
+      OrganizationId="$FIP_ORG_ID" \
       DeployResponderRole=Yes \
       AllowRestore=Yes \
   --tags application=fipv2 fip:class=infrastructure fip:component=member fip:environment=test
@@ -1714,6 +1729,17 @@ aws cloudformation deploy --profile $FIP_MEMBER_PROFILE \
 
 The `--tags` line gives the stack the product tags of §11. In production, write
 `fip:environment=production`, and add any tags of your own to the same line.
+
+`OrganizationId` is required, with no default: your organization id, so each role
+also requires the orchestrator to be inside your organization (`aws:PrincipalOrgID`),
+or `none` if you have no organization. Check it took:
+
+```sh
+aws iam get-role --profile $FIP_MEMBER_PROFILE --role-name FipInventoryRole \
+  --query 'Role.AssumeRolePolicyDocument.Statement[].Condition.StringEquals."aws:PrincipalOrgID"' --output text
+```
+
+It must print your organization id, or `None` when you configured `none`.
 
 `DeployResponderRole=No` installs only the read-only `FipInventoryRole`. Use that to
 grant visibility before an engagement begins, and switch it to `Yes` when response

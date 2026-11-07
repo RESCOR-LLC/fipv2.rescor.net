@@ -74,23 +74,36 @@ describe('FipInventoryRole', () => {
     );
   });
 
-  test('org condition present with an org, absent without one', () => {
-    const withOrg = Object.values(synth(ORG).findResources('AWS::IAM::Role'))
+  test('org condition is the OrganizationId parameter, on every trust statement', () => {
+    const t = synth();
+    const stmts = Object.values(t.findResources('AWS::IAM::Role'))
       .flatMap((r) => r.Properties.AssumeRolePolicyDocument.Statement);
-    assert.strictEqual(
-      withOrg[0].Condition.StringEquals['aws:PrincipalOrgID'], ORG,
-    );
+    assert.ok(stmts.length > 0);
+    for (const s of stmts) {
+      assert.deepStrictEqual(s.Condition.StringEquals['aws:PrincipalOrgID'], {
+        'Fn::If': ['HasOrganization', { Ref: 'OrganizationId' }, { Ref: 'AWS::NoValue' }],
+      });
+      assert.ok(
+        s.Condition.StringEquals['sts:ExternalId'] !== undefined,
+        'external ID must stay whether or not there is an organization',
+      );
+    }
+    t.hasCondition('HasOrganization', {
+      'Fn::Not': [{ 'Fn::Equals': [{ Ref: 'OrganizationId' }, 'none'] }],
+    });
+  });
 
-    const without = Object.values(synth(null).findResources('AWS::IAM::Role'))
-      .flatMap((r) => r.Properties.AssumeRolePolicyDocument.Statement);
-    assert.strictEqual(
-      without[0].Condition.StringEquals['aws:PrincipalOrgID'], undefined,
-      'no organization must still deploy — external ID carries the guard',
-    );
-    assert.ok(
-      without[0].Condition.StringEquals['sts:ExternalId'] !== undefined,
-      'external ID must survive when the org condition is dropped',
-    );
+  test('OrganizationId has no default, so a deploy that omits it fails', () => {
+    const params = synth().toJSON().Parameters;
+    assert.ok(params.OrganizationId, 'the parameter exists');
+    assert.strictEqual(params.OrganizationId.Default, undefined);
+    const re = new RegExp(params.OrganizationId.AllowedPattern);
+    assert.ok(re.test('o-exampleorg1') && re.test('none'));
+    assert.ok(!re.test('') && !re.test('None') && !re.test('o-'));
+  });
+
+  test('the template is the same whatever orgId is passed: no install baked in', () => {
+    assert.deepStrictEqual(synth(ORG).toJSON(), synth(null).toJSON());
   });
 
   test('orchestrator account is a deploy-time parameter, not baked in', () => {
