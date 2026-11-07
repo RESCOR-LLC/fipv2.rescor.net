@@ -13,9 +13,10 @@ commands, for when `fip` is unavailable. Teardown lives in
 
 > **Status.** Acquisition, containment, evidence copy and signed manifests are built and
 > exercised against live instances (Linux and Windows, standalone and in Auto Scaling
-> groups). Fleet-scale cases, the isolated analysis workstation and the evidence release
-> path are built but have not yet been exercised against live instances. Memory capture,
-> detonation and GuardDuty triggers are **not** built. `fip case` is partly built (§5.3).
+> groups), as are incident cases (§5) and the evidence release path. Large fleet-scale
+> runs and the isolated analysis workstation are built but have not yet been exercised
+> against live instances. Memory capture, detonation and GuardDuty triggers are **not**
+> built.
 > See [What FIP does not do](#13-what-fip-does-not-do).
 
 ## Contents
@@ -32,15 +33,17 @@ commands, for when `fip` is unavailable. Teardown lives in
   - [3.3 Deploy](#33-deploy)
   - [3.4 Check the install](#34-check-the-install)
   - [3.5 Add a member account later](#35-add-a-member-account-later)
-- [4. Running a case](#4-running-a-case)
+- [4. Responding to an incident](#4-responding-to-an-incident)
   - [4.1 Testing only: create a test instance](#41-testing-only-create-a-test-instance)
-  - [4.2 Find the instance](#42-find-the-instance)
-  - [4.3 Isolate it](#43-isolate-it)
-  - [4.4 Check on it later](#44-check-on-it-later)
-  - [4.5 Collect the evidence](#45-collect-the-evidence)
-  - [4.6 Give an examiner access](#46-give-an-examiner-access)
-  - [4.7 Restore the instance](#47-restore-the-instance)
-  - [4.8 Testing only: clean up](#48-testing-only-clean-up)
+  - [4.2 Open or find the case](#42-open-or-find-the-case)
+  - [4.3 Find the instance](#43-find-the-instance)
+  - [4.4 Isolate it](#44-isolate-it)
+  - [4.5 Check on it later](#45-check-on-it-later)
+  - [4.6 Collect the evidence](#46-collect-the-evidence)
+  - [4.7 Give an examiner access](#47-give-an-examiner-access)
+  - [4.8 Restore the instances](#48-restore-the-instances)
+  - [4.9 Close the case](#49-close-the-case)
+  - [4.10 Testing only: clean up](#410-testing-only-clean-up)
 - [5. Cases](#5-cases)
   - [5.1 Two ways to respond](#51-two-ways-to-respond)
   - [5.2 What a single isolation records](#52-what-a-single-isolation-records)
@@ -64,6 +67,7 @@ commands, for when `fip` is unavailable. Teardown lives in
 - [7. Reading a manifest](#7-reading-a-manifest)
   - [Integrity and origin](#integrity-and-origin)
   - [Integrity by hand](#integrity-by-hand)
+  - [Reading a case log](#reading-a-case-log)
 - [8. Production retention — a decision, not a default](#8-production-retention--a-decision-not-a-default)
 - [9. Containment and Auto Scaling](#9-containment-and-auto-scaling)
   - [What happens, in order](#what-happens-in-order)
@@ -86,11 +90,11 @@ commands, for when `fip` is unavailable. Teardown lives in
   - [A.3 Bootstrap and deploy the two central stacks](#a3-bootstrap-and-deploy-the-two-central-stacks)
   - [A.4 Issue an external ID per member account](#a4-issue-an-external-id-per-member-account)
   - [A.5 Deploy the member stack](#a5-deploy-the-member-stack)
-- [Appendix B. Case management with shell commands](#appendix-b-case-management-with-shell-commands)
+- [Appendix B. Isolation with shell commands](#appendix-b-isolation-with-shell-commands)
   - [B.1 Launch a test instance by hand](#b1-launch-a-test-instance-by-hand)
   - [B.2 Find the instance by hand](#b2-find-the-instance-by-hand)
-  - [B.3 Start a case by hand](#b3-start-a-case-by-hand)
-  - [B.4 Watch a case by hand](#b4-watch-a-case-by-hand)
+  - [B.3 Start an isolation by hand](#b3-start-an-isolation-by-hand)
+  - [B.4 Watch an isolation by hand](#b4-watch-an-isolation-by-hand)
   - [B.5 Collect and verify the evidence by hand](#b5-collect-and-verify-the-evidence-by-hand)
   - [B.6 Clean up a test by hand](#b6-clean-up-a-test-by-hand)
   - [B.7 Restore by hand](#b7-restore-by-hand)
@@ -106,9 +110,10 @@ commands, for when `fip` is unavailable. Teardown lives in
 | **Acquire** | Crash-consistent multi-volume snapshot, tagged at creation |
 | **Verify** | SHA-256 Merkle digest over the block stream, without attaching, mounting or booting anything |
 | **Move** | Snapshot copied into the evidence account, re-encrypted under your forensic key |
-| **Attest** | Case manifest signed with an asymmetric key, written to an Object Lock bucket |
+| **Attest** | Manifest signed with an asymmetric key, written to an Object Lock bucket |
 | **Optionally stop** | The instance, if you ask for it |
-| **At fleet scale** | One case covers many instances across many accounts. A target that fails is recorded, not fatal to the case |
+| **At fleet scale** | One run covers many instances across many accounts. A target that fails is recorded, not fatal to the run |
+| **Keep an incident together** | An incident case gathers every run, ticket, comment, release and restore of one incident in a signed, chained log (§5) |
 
 FIP never terminates an instance and never deletes a snapshot. Those permissions are
 absent from its roles and denied by a permissions boundary. The one command that
@@ -126,13 +131,13 @@ One executable, `fip`. Every subcommand takes `--help`; §6 is the full referenc
 | `fip doctor` | Check the install can do its job | [§6.3](#63-fip-doctor) |
 | `fip instances` | List instances in the member accounts, as targets | [§6.4](#64-fip-instances) |
 | `fip test-instance` | Testing only: launch an instance to try FIP on | [§6.5](#65-fip-test-instance) |
-| `fip isolate` | Contain and acquire one or more instances, as one case | [§6.6](#66-fip-isolate) |
-| `fip status` | Where a case stands | [§6.7](#67-fip-status) |
-| `fip evidence` | Download a case's signed records and verify them | [§6.8](#68-fip-evidence) |
+| `fip isolate` | Contain and acquire one or more instances, as one isolation run | [§6.6](#66-fip-isolate) |
+| `fip status` | Where a case or a run stands | [§6.7](#67-fip-status) |
+| `fip evidence` | Download a case's or a run's signed records and verify them | [§6.8](#68-fip-evidence) |
 | `fip verify` | Check one signed record | [§6.9](#69-fip-verify) |
 | `fip signing-key` | Export the public signing key | [§6.10](#610-fip-signing-key) |
 | `fip release` | Give, or withdraw, an analysis account access to a case's evidence | [§6.11](#611-fip-release) |
-| `fip restore` | Put a contained instance back on its original security groups | [§6.12](#612-fip-restore) |
+| `fip restore` | Put contained instances back on their original security groups | [§6.12](#612-fip-restore) |
 | `fip cleanup` | List what FIP made, or remove what a test made | [§6.13](#613-fip-cleanup) |
 | `fip version` | Which checkout `fip` runs from | [§6.14](#614-fip-version) |
 | `fip case` | Incident cases: tickets, signed comments, the isolations of one incident, moves, merges, close and reopen | [§6.15](#615-fip-case) |
@@ -234,17 +239,23 @@ fip deploy --only members
 
 ---
 
-## 4. Running a case
+## 4. Responding to an incident
 
-These steps are for when you know exactly what to isolate. For an incident still
-unfolding, see §5. The steps share two values, set once:
+Open or find the incident's case first, then isolate each host into it as you find it.
+Every later step can then name the case, and acts on every host in it. When you know
+exactly what to isolate and expect nothing more, the case is optional: skip §4.2 and
+§4.9, drop `--case $CASE` from `fip isolate`, use the run id it prints in place of
+`$CASE`, and restore each host with `fip restore $TARGET` (§5.1 says when).
+
+The steps share three values:
 
 | | Looks like | Comes from |
 |---|---|---|
+| `CASE` | `case-20261105T101500Z-3f9a1c` | `fip case open` prints it, or `fip case list` |
 | `TARGET` | `444444444444:i-0123456789abcdef0` | `fip instances`, or `fip test-instance` |
-| `CASE_ID` | `fip-20261104T040328Z-62b079` | `fip isolate` prints it |
+| `RUN` | `fip-20261104T040328Z-62b079` | `fip isolate` prints it: one isolation run |
 
-By hand, with `aws` commands: [Appendix B](#appendix-b-case-management-with-shell-commands).
+By hand, with `aws` commands: [Appendix B](#appendix-b-isolation-with-shell-commands).
 
 ### 4.1 Testing only: create a test instance
 
@@ -254,10 +265,20 @@ Skip in a real incident.
 TARGET=$(fip test-instance --quiet)
 ```
 
-Then go to §4.3. Remove it afterwards with §4.8. Reference:
-[§6.5](#65-fip-test-instance).
+Remove it afterwards with §4.10. Reference: [§6.5](#65-fip-test-instance).
 
-### 4.2 Find the instance
+### 4.2 Open or find the case
+
+```sh
+fip case list                                         # is one already open?
+fip case open --ticket INC-1234 --comment "beaconing from web tier"
+CASE=case-20261105T101500Z-3f9a1c                     # printed by open
+```
+
+The ticket is your own system's id, and optional; add one later with `fip case ticket`.
+Reference: [§6.15](#615-fip-case).
+
+### 4.3 Find the instance
 
 ```sh
 fip instances --name 'web-*'
@@ -266,56 +287,70 @@ TARGET=444444444444:i-0cfa397d72897506e      # from the TARGET column
 
 Reference: [§6.4](#64-fip-instances).
 
-### 4.3 Isolate it
+### 4.4 Isolate it
 
 ```sh
-fip isolate $TARGET --dry-run     # every target must read OK
-fip isolate $TARGET --watch       # asks to confirm, then follows the case
-CASE_ID=fip-20261104T040328Z-62b079     # printed near the top
+fip isolate --case $CASE $TARGET --dry-run     # every target must read OK
+fip isolate --case $CASE $TARGET --watch       # asks to confirm, then follows the run
 ```
 
-Several targets, in any accounts, go in one command. It ends `ACQUIRED`; `PARTIAL` and
-`FAILED` are explained in [§5.2](#52-what-a-single-isolation-records). Options, such as `--stop`:
-[§6.6](#66-fip-isolate).
+Several targets, in any accounts, go in one command; run it again for each host found
+later. The run ends `ACQUIRED`; `PARTIAL` and `FAILED` are explained in
+[§5.2](#52-what-a-single-isolation-records). Without `--case`, `fip isolate` lists any
+open cases and proceeds without one; `fip case move` puts the run in a case afterwards.
+Options, such as `--stop`: [§6.6](#66-fip-isolate).
 
-### 4.4 Check on it later
+### 4.5 Check on it later
 
 ```sh
-fip status $CASE_ID --watch
+fip status $CASE
 ```
 
+Lists every host in the case: its acquisition, whether it is still contained, and who
+its evidence is shared to. For one run's copy progress: `fip status $RUN --watch`.
 Reference: [§6.7](#67-fip-status).
 
-### 4.5 Collect the evidence
+### 4.6 Collect the evidence
 
 ```sh
-fip evidence $CASE_ID
+fip evidence $CASE
 ```
 
-The last line must read `All N record(s) verified`. Reference:
+Every record must verify, and the case log must check as a chain. Reference:
 [§6.8](#68-fip-evidence); what a manifest holds: [§7](#7-reading-a-manifest).
 
-### 4.6 Give an examiner access
+### 4.7 Give an examiner access
 
 ```sh
-fip release --case $CASE_ID --to 333333333333
+fip release --case $CASE --to 333333333333
 ```
 
-Reference: [§6.11](#611-fip-release); the analysis account itself: [§10](#10-analysis-access).
+Every host's evidence, under one grant. Reference: [§6.11](#611-fip-release); the
+analysis account itself: [§10](#10-analysis-access).
 
-### 4.7 Restore the instance
+### 4.8 Restore the instances
 
-Only once you have decided it is fit to reconnect.
+Only once you have decided each is fit to reconnect.
 
 ```sh
-fip restore $TARGET --dry-run     # "Originals from" must say the signed manifest
-fip restore $TARGET               # ends with "Restored."
+fip restore --case $CASE --dry-run     # "Originals from" must say the signed manifest
+fip restore --case $CASE               # ends with "Restored." for each host
 ```
 
-Auto Scaling capacity is not put back for you; the output gives the command. Reference:
-[§6.12](#612-fip-restore).
+Name members after the case to restore only those. Auto Scaling capacity is not put back
+for you; the output gives the command. Reference: [§6.12](#612-fip-restore).
 
-### 4.8 Testing only: clean up
+### 4.9 Close the case
+
+```sh
+fip release --case $CASE --to 333333333333 --revoke    # once the examiner is done
+fip case close $CASE --comment "contained; RCA in INC-1234"
+```
+
+Close is refused while any host is still contained or any evidence is still shared.
+Closing deletes nothing. Reference: [§6.15](#615-fip-case).
+
+### 4.10 Testing only: clean up
 
 **Never in a real case**: it deletes the evidence.
 
@@ -329,6 +364,16 @@ Reference: [§6.13](#613-fip-cleanup).
 ---
 
 ## 5. Cases
+
+**Terms.**
+
+| Term | Means |
+|---|---|
+| **Isolation run** | One `fip isolate` command, with any number of targets: id `fip-<UTC time>-<random>`. Older output and tags call it a case id (`fip:case-id`, `--case-id`) |
+| **Incident case**, or **case** | One incident: id `case-<UTC time>-<random>`. Holds members, tickets, comments, and a state: open, closed, or merged |
+| **Member** | One target of one run, recorded in a case: `<run id>/<instance id>`. A member is in at most one case |
+| **Alias** | A case merged into another. Commands given its id act on the case it merged into |
+| **Case log** | The case's signed, chained records, schema `fip.case/1` ([§7](#reading-a-case-log)) |
 
 ### 5.1 Two ways to respond
 
@@ -374,8 +419,8 @@ re-running its id with a different `--case` is refused.
 
 ### 5.3 `fip case`
 
-Every command below works (§6.15, §6.6), and `status`, `restore`, `release` and
-`evidence` accept a case (§6.7, §6.8, §6.11, §6.12).
+The verbs are in §6.15; `isolate`, `status`, `restore`, `release` and `evidence` accept
+a case (§6.6, §6.7, §6.8, §6.11, §6.12).
 
 A **case** is one incident. It holds the isolations made under it (each still a
 `fip isolate` run, with its own id and records, unchanged), tickets from your own
@@ -396,18 +441,18 @@ fip release --case $CASE --to 333333333333      # every host's evidence at once
 fip case close $CASE --comment "contained; RCA in INC-1234"
 ```
 
-| Command | Does | Built |
-|---|---|---|
-| `fip case open [--ticket T]… [--comment C]` | Open an incident and print its id | Yes |
-| `fip case list [--all] [--ticket T]` | List open cases; `--all` adds closed cases and every isolation run | Yes |
-| `fip case show <case> [--verify]` | The case as a timeline, with its log verified | Yes |
-| `fip case ticket <case> T [--comment C]` | Add a ticket. A case may carry several, from different systems | Yes |
-| `fip case comment <case> C` | Add a signed, permanent comment | Yes |
-| `fip isolate --case <case>` | Record an isolation run under the case | Yes |
-| `fip case move <isolation or target>… --to <case> --comment C` | Move a whole isolation (`fip-…`), one target of it (`fip-…/i-…`) or every member of a case (`case-…`) into another case | Yes |
-| `fip case merge <into> <from>… --comment C` | Fold whole cases into one. Each `<from>` becomes an alias of `<into>` | Yes |
-| `fip case close <case> --comment C [--force]` | Close. Refused while any host is still contained or any evidence is still shared; `--force` overrides, and is recorded | Yes |
-| `fip case reopen <case> --comment C` | Reopen a closed case | Yes |
+| Command | Does |
+|---|---|
+| `fip case open [--ticket T]… [--comment C]` | Open an incident and print its id |
+| `fip case list [--all] [--ticket T]` | List open cases; `--all` adds closed cases and every isolation run |
+| `fip case show <case> [--verify]` | The case as a timeline, with its log verified |
+| `fip case ticket <case> T [--comment C]` | Add a ticket. A case may carry several, from different systems |
+| `fip case comment <case> C` | Add a signed, permanent comment |
+| `fip isolate --case <case>` | Record an isolation run under the case |
+| `fip case move <isolation or target>… --to <case> --comment C` | Move a whole isolation (`fip-…`), one target of it (`fip-…/i-…`) or every member of a case (`case-…`) into another case |
+| `fip case merge <into> <from>… --comment C` | Fold whole cases into one. Each `<from>` becomes an alias of `<into>` |
+| `fip case close <case> --comment C [--force]` | Close. Refused while any host is still contained or any evidence is still shared; `--force` overrides, and is recorded |
+| `fip case reopen <case> --comment C` | Reopen a closed case |
 
 Wherever a case id is accepted, `--ticket T` also works if exactly one case carries
 that ticket; if several do, the command lists them and refuses to guess.
@@ -599,16 +644,16 @@ could never be copied. Use a key of your own. By hand:
 fip isolate [options] <account>:<instance> [<account>:<instance> …]
 ```
 
-Contains and acquires each target, as one case: moves every interface to a security
+Contains and acquires each target, as one isolation run: moves every interface to a security
 group with no rules, detaches the instance from its Auto Scaling group without a
 replacement, snapshots and hashes the volumes, copies them to the evidence account,
 and writes a signed manifest. The steps, in order: [§9](#9-containment-and-auto-scaling).
-It confirms first and prints the case id near the top.
+It confirms first and prints the run id near the top.
 
 | Option | Meaning |
 |---|---|
-| `--dry-run` | Pre-flight only. Starts nothing; the case id it prints is thrown away |
-| `--watch` | Then follow the case until it finishes, as `fip status --watch` |
+| `--dry-run` | Pre-flight only. Starts nothing; the run id it prints is thrown away |
+| `--watch` | Then follow the run until it finishes, as `fip status --watch` |
 | `--case-id ID` | Add the targets to an earlier run (§5.2). Default: a new id |
 | `--case CASE` | Record this run under an open incident case (§5.3). Checked before anything is touched: a closed or unknown case stops the run in pre-flight |
 | `--ticket T` | The same, naming the case by a ticket exactly one case carries |
@@ -620,13 +665,13 @@ It confirms first and prints the case id near the top.
 no external ID, or a stack never deployed fails in seconds and names the target. If any
 target fails, **nothing** is started.
 
-**How long.** It prints an expected duration per target and for the case, and when a
-case still `IN_PROGRESS` is worth looking into. It is an order of magnitude, from
+**How long.** It prints an expected duration per target and for the run, and when a
+run still `IN_PROGRESS` is worth looking into. It is an order of magnitude, from
 provisioned volume size: a small Linux instance takes about nine minutes, a 30 GiB
-Windows volume about fifty. Targets run four at a time, so a large case runs in waves.
+Windows volume about fifty. Targets run four at a time, so a large run goes in waves.
 
-Ctrl-C stops `--watch`, not the case. By hand:
-[Appendix B.3](#b3-start-a-case-by-hand).
+Ctrl-C stops `--watch`, not the run. By hand:
+[Appendix B.3](#b3-start-an-isolation-by-hand).
 
 ### 6.7 `fip status`
 
@@ -647,7 +692,7 @@ run's copy progress, `fip status <run id>`.
 
 Prints the run's state (§5.2), each target's state, the custody events, and the
 progress of the evidence copies: size, percent complete, throughput, ETA. `--watch`
-refreshes until the case leaves `IN_PROGRESS`, every `--interval` seconds (default 20).
+refreshes until the run leaves `IN_PROGRESS`, every `--interval` seconds (default 20).
 
 **Early on it shows almost nothing.** A target appears only once its acquisition
 finishes, and reads `not yet recorded` until then, about eight minutes for a small
@@ -655,7 +700,7 @@ Linux instance.
 
 **The ETA is an order of magnitude.** Size and percent are EC2's; throughput is
 extrapolated. Sizes are provisioned, not used, so the ETA is pessimistic early. Hashing
-follows the copy and is not in it. By hand: [Appendix B.4](#b4-watch-a-case-by-hand).
+follows the copy and is not in it. By hand: [Appendix B.4](#b4-watch-an-isolation-by-hand).
 
 ### 6.8 `fip evidence`
 
@@ -664,13 +709,16 @@ fip evidence <run-id | case-id | --ticket T> [--out DIR]
 ```
 
 **Given an incident case**, it downloads the case's log and custody records into
-`case/`, and each member's manifest and its run's custody records into
-`members/<run>/`, and verifies every one. It also checks the case log as a **chain**:
-a record deleted, reordered or replaced fails even when each remaining record verifies
-on its own.
+`case/`, each member's manifest and its run's custody records into `members/<run>/`,
+and the log and custody records of every case merged into it, however many merges
+back, into `merged/<case>/`. A release made before a merge is recorded only in the
+merged case, so those records belong to the evidence. It verifies every one, and checks
+each case log as a **chain**: a record deleted, reordered or replaced fails even when
+each remaining record verifies on its own.
 
-Downloads the case's manifests and custody records into `./<case-id>`, or `--out DIR`,
-and verifies each as `fip verify --ours` does. Changes nothing in AWS.
+**Given an isolation run**, it downloads the run's manifests and custody records into
+`./<run-id>`, or `--out DIR`, and verifies each as `fip verify --ours` does. Either way
+it changes nothing in AWS.
 
 You get one `manifest.json` per instance, in a folder named for it, and a `custody/`
 folder once evidence is released or an instance restored. **Worked when** the last
@@ -731,15 +779,22 @@ revoke is a signed custody record under the case, an entry on each member's run,
 `RELEASED` or `REVOKED` record in the case log. A closed case releases nothing; reopen
 it first. A revoke is always allowed.
 
-Gives an analysis account (§10) access to a case's evidence: a share of each evidence
-snapshot, and a KMS grant on the forensic key. It needs both: a shared encrypted
-snapshot cannot be opened without the grant. The snapshot ids come from the case row.
-The account may be outside your organization.
+**Given an isolation run**, it does the same for that run's evidence alone, but only
+for a run in no case. A run whose hosts are in an incident case is refused, with the
+case to use instead, so that every release is in the case's log and a closed case stays
+closed.
+
+Either way it gives an analysis account (§10) a share of each evidence snapshot and a
+KMS grant on the forensic key. It needs both: a shared encrypted snapshot cannot be
+opened without the grant. The grant is created first, and if the signed record cannot
+be written, the shares and the grant are withdrawn again, so access never exists
+without its record. The snapshot ids come from the table, not the command line. The
+account may be outside your organization.
 
 The analysis account may create volumes from the snapshots and decrypt them; not delete
 them, re-encrypt them under your key, or widen its own access. Each release writes a
-signed custody record, `cases/<case-id>/custody/<time>-release.json`, and an entry on
-the case row.
+signed custody record, `cases/<id>/custody/<time>-release.json`, and an entry on the
+row.
 
 | Option | Meaning |
 |---|---|
@@ -812,12 +867,12 @@ fip cleanup --test [--dry-run] [--yes]
 ```
 
 `--list` shows everything tagged `application=fipv2` in each configured account, with
-its class (§11). Changes nothing.
+its class (§11) and incident case (`fip:case`), grouped by both. Changes nothing.
 
 `--test` terminates instances and deletes snapshots tagged both `application=fipv2` and
 `fip:class=test`: the test instance and its snapshots, in the member and evidence
 accounts. It shows them and asks first; `--dry-run` only shows them. It runs with your
-own profiles, not FIP's roles. **Never run it on a real case.**
+own profiles, not FIP's roles. **Never run it in a real incident.**
 
 **Worked when** `fip cleanup --test --dry-run` afterwards prints
 `Nothing tagged application=fipv2 and fip:class=test in any configured account.`
@@ -871,7 +926,8 @@ targets in the case as it starts, before any host is touched. Each target become
 `show` lists them. A closed or unknown case refuses the run at its first step. The run's
 own id, records and evidence are unchanged; the case only points at them.
 
-**The case log.** Each event is a signed record, schema `fip.case/1`, at
+**The case log.** Each event is a signed record, schema `fip.case/1` (fields:
+[§7](#reading-a-case-log)), at
 `cases/<case-id>/log/<sequence>.json` in the evidence bucket, under the same Object Lock
 settings as manifests (§8). Each record holds the SHA-256 of the one before it, so a
 deleted, reordered or replaced record is detectable even in test mode, where nothing is
@@ -970,6 +1026,53 @@ The signature covers an exact byte sequence. The readable copy nested in the env
 for humans; re-serializing it will not reproduce those bytes, because its indentation
 differs once nested. `signature.signedPayloadSha256` lets you confirm you decoded the
 right thing before you start.
+
+### Reading a case log
+
+An incident case's log is a series of records at
+`cases/<case-id>/log/000001.json`, `000002.json` and so on, in the evidence bucket.
+Each file is a signed envelope like a manifest: the signature, the public key and
+`signedPayloadBase64`, which holds the exact bytes that were signed. The signed
+document, schema `fip.case/1`, always has:
+
+| Field | Holds |
+|---|---|
+| `schema` | `fip.case/1` |
+| `caseId` | The case |
+| `seq` | The record's number, from 1; also its file name |
+| `event` | What happened (below) |
+| `at` | When, in UTC |
+| `actor` | Who: the AWS identity that ran the command |
+| `prev` | `null` in record 1. Otherwise `seq`, `key` and `sha256` of the record before: the SHA-256 of that record's signed bytes |
+
+and, by event:
+
+| `event` | Also holds |
+|---|---|
+| `OPENED` | `tickets`, `comment`. Always record 1 |
+| `TICKET_ADDED` | `ticket`, `comment` |
+| `COMMENT` | `comment` |
+| `MEMBER_ATTACHED` | `actionId` (the run), `executionArn`, `members`: each `member`, `accountId`, `instanceId` |
+| `MEMBER_MOVED` | `from` (a case, or `null` for a run in no case), `to`, `members`, `comment`; `via: merge` when a merge made it. The source case's copy adds `counterpart`, naming the destination's record |
+| `MERGED` | In the case merged away: `mergedInto`, `comment`. In the survivor: `absorbed`, `tickets`, `comment`, `counterpart` |
+| `ABORTED` | `aborts` (the `seq`, `key` and `event` withdrawn) and `reason`. Written when a move, merge or close was refused after its record was signed; the withdrawn record changed nothing |
+| `RELEASED`, `REVOKED` | `analysisAccountId`, `members`, `snapshots`, `kmsGrantNames`, `custodyKey` (the matching custody record) |
+| `CLOSED` | `comment`, `forced`, `overridden` (what `--force` overrode, empty if nothing), `memberCount` |
+| `REOPENED` | `comment` |
+
+**Checking the chain.** `fip evidence <case>` and `fip case show` check each record's
+signature, and then that record N's `prev.sha256` is the SHA-256 of record N−1's
+signed bytes, that numbers run from 1 with no gap, and that record 1 is `OPENED`. A
+deleted record leaves a gap; a replaced or reordered one breaks a hash. By hand, for
+records 1 and 2:
+
+```sh
+jq -r .signature.signedPayloadBase64 000001.json | base64 -d | shasum -a 256
+jq -r .signature.signedPayloadBase64 000002.json | base64 -d | jq -r .prev.sha256
+```
+
+The two hashes must match. Each record's signature is checked as for a manifest, above,
+or with `fip verify <file> --ours`.
 
 ---
 
@@ -1188,7 +1291,8 @@ remove what a test made without touching anything else.
 | `fip:class` | `infrastructure` · `evidence` · `test` | The same. Decides what a cleanup may remove |
 | `fip:component` | `core` · `orchestrator` · `member` · `analysis` | The stacks and their resources |
 | `fip:environment` | `test` · `production` | The stacks, from `fip deploy`, and what FIP creates |
-| `fip:case-id` | the case id | Everything a case touched, as before |
+| `fip:case-id` | the isolation run id | Everything a run touched: the instance, its volumes and interfaces, and every snapshot |
+| `fip:case` | the incident case id | Snapshots and evidence copies of a run made with `--case`. Set once, at creation: a later move or merge does not change it, so the case log, not the tag, says where a member is now |
 | your own | from `fip configure --tag` | The stacks and their resources |
 
 **`fip:class` is the one that matters.**
@@ -1655,7 +1759,7 @@ and its profile as in A.1, and repeat A.4 and A.5.
 
 ---
 
-## Appendix B. Case management with shell commands
+## Appendix B. Isolation with shell commands
 
 Each section does one `fip` step with `aws` commands, for when `fip` is unavailable or
 you want to see what it does. They use the values `fip configure` saved, so load them
@@ -1665,7 +1769,7 @@ into the shell first:
 source ~/.fip/install.env
 ```
 
-`TARGET` and `CASE_ID` are the values from §4. The instance id alone is the part of
+`TARGET` and `RUN` are the values from §4. The instance id alone is the part of
 `TARGET` after the colon:
 
 ```sh
@@ -1705,7 +1809,7 @@ aws ec2 describe-instances --profile $FIP_MEMBER_PROFILE \
   --output table
 ```
 
-### B.3 Start a case by hand
+### B.3 Start an isolation by hand
 
 `fip isolate` pre-flights each target, then starts the `FipCase` state machine. Starting
 it directly skips the pre-flight:
@@ -1714,7 +1818,7 @@ it directly skips the pre-flight:
 aws stepfunctions start-execution --profile $FIP_ORCHESTRATOR_PROFILE \
   --state-machine-arn arn:aws:states:${AWS_REGION}:${FIP_ORCHESTRATOR_ACCOUNT_ID}:stateMachine:FipCase \
   --input '{
-    "caseId": "CASE-2026-0001",
+    "caseId": "fip-manual-0001",
     "stopInstance": false,
     "targets": [
       { "accountId": "111122223333", "instanceId": "i-0abc" },
@@ -1725,15 +1829,15 @@ aws stepfunctions start-execution --profile $FIP_ORCHESTRATOR_PROFILE \
 
 | Field | Meaning |
 |---|---|
-| `caseId` | Yours to choose. Becomes the `fip:case-id` tag, the manifest prefix and the case-table key |
+| `caseId` | The run id (the field keeps its older name). Yours to choose; start it `fip-` so `fip case` can attach and move it. Becomes the `fip:case-id` tag, the manifest prefix and the table key |
 | `targets` | One `{accountId, instanceId}` per instance. Any number, any mix of accounts |
-| `stopInstance` | Applies to every target in the case. Optional, default `false` |
+| `stopInstance` | Applies to every target in the run. Optional, default `false` |
 | `asgPolicy` | `prevent-replacement` (default) or `allow-replacement`. Optional |
 
 `FipCase` fans out to one `FipAcquisition` execution per target, so `FipAcquisition`
 still takes a single `accountId`/`instanceId` if you want to drive one instance directly.
 
-### B.4 Watch a case by hand
+### B.4 Watch an isolation by hand
 
 `fip status` reads two things. The execution, using the ARN `fip isolate` printed:
 
@@ -1742,11 +1846,11 @@ aws stepfunctions describe-execution --profile $FIP_ORCHESTRATOR_PROFILE \
   --execution-arn <execution ARN> --query status
 ```
 
-And the case row, which lives in the **evidence** account:
+And the run's row, which lives in the **evidence** account:
 
 ```sh
 aws dynamodb get-item --profile $FIP_EVIDENCE_PROFILE --table-name fip-cases \
-  --key "{\"caseId\":{\"S\":\"$CASE_ID\"}}"
+  --key "{\"caseId\":{\"S\":\"$RUN\"}}"
 ```
 
 ### B.5 Collect and verify the evidence by hand
@@ -1757,7 +1861,7 @@ account and finds no FIP bucket at all. Copy the case to the current directory:
 
 ```sh
 aws s3 cp --recursive --profile $FIP_EVIDENCE_PROFILE \
-  s3://fip-evidence-$FIP_EVIDENCE_ACCOUNT_ID-$AWS_REGION/cases/$CASE_ID/ .
+  s3://fip-evidence-$FIP_EVIDENCE_ACCOUNT_ID-$AWS_REGION/cases/$RUN/ .
 ```
 
 Then check each file against your signing key. `--ours` looks the key up in the
@@ -1794,7 +1898,7 @@ the `fip:case-id` tag, so this finds exactly that case's snapshots. List them fi
 ```sh
 for p in $FIP_MEMBER_PROFILE $FIP_EVIDENCE_PROFILE; do
   echo "$p: $(aws ec2 describe-snapshots --profile $p --owner-ids self \
-    --filters Name=tag:fip:case-id,Values=$CASE_ID --query 'Snapshots[].SnapshotId' --output text)"
+    --filters Name=tag:fip:case-id,Values=$RUN --query 'Snapshots[].SnapshotId' --output text)"
 done
 ```
 
@@ -1803,7 +1907,7 @@ If those are the test case's snapshots, delete them:
 ```sh
 for p in $FIP_MEMBER_PROFILE $FIP_EVIDENCE_PROFILE; do
   for s in $(aws ec2 describe-snapshots --profile $p --owner-ids self \
-      --filters Name=tag:fip:case-id,Values=$CASE_ID --query 'Snapshots[].SnapshotId' --output text); do
+      --filters Name=tag:fip:case-id,Values=$RUN --query 'Snapshots[].SnapshotId' --output text); do
     aws ec2 delete-snapshot --profile $p --snapshot-id $s && echo "deleted $p $s"
   done
 done

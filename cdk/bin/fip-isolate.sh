@@ -67,7 +67,7 @@ Options:
   --region R     AWS region. Default: $AWS_REGION, else us-east-1.
   --dry-run      Pre-flight the targets and print what would run. Starts nothing.
   --yes          Skip the confirmation prompt. For scripted callers.
-  --watch        Then follow the case until it finishes (fip status --watch).
+  --watch        Then follow the run until it finishes (fip status --watch).
   -h, --help     This message.
 
 Examples:
@@ -370,7 +370,7 @@ for target in "${VALIDATED[@]}"; do
 done
 EST_SPAN="$(span "$EST_LOW" "$EST_HIGH")"
 EST_AFTER="$(after "$EST_LATE")"
-echo "  Whole case ......... about ${EST_SPAN}, in ${EST_WAVES} wave(s) of up to ${CASE_CONCURRENCY}"
+echo "  Whole run .......... about ${EST_SPAN}, in ${EST_WAVES} wave(s) of up to ${CASE_CONCURRENCY}"
 echo "  Look into it if still IN_PROGRESS after ${EST_AFTER}."
 echo "  Based on provisioned size; volumes holding little data finish sooner."
 echo
@@ -451,7 +451,7 @@ PROFILE_OPTION="${AWS_PROFILE:+--profile $AWS_PROFILE }"
 
 cat <<EOF
 
-Case started.
+Isolation run started.
 
   Run id ........ $CASE_ID
   Incident case . ${INCIDENT:-none (standalone)}
@@ -459,7 +459,7 @@ Case started.
   Targets ....... ${#VALIDATED[@]}
   Expect ........ about ${EST_SPAN}; look into it after ${EST_AFTER}
 
-Follow it from the shell. This reads the case row in the evidence account for you:
+Follow it from the shell. This reads the run's row in the evidence account for you:
   ${PROFILE_PREFIX}fip status $CASE_ID --watch
 
 Or in the console, signed in to the orchestrator account:
@@ -469,7 +469,7 @@ Raw execution status only:
   aws stepfunctions describe-execution ${PROFILE_OPTION}--region $REGION \\
       --execution-arn $EXECUTION_ARN --query status --output text
 
-A case finishes ACQUIRED (every target), PARTIAL (some targets) or FAILED
+A run finishes ACQUIRED (every target), PARTIAL (some targets) or FAILED
 (none). PARTIAL is a success for the targets that worked — their evidence and
 manifests are real. Re-running the same --case-id retries only what you name.
 EOF
@@ -482,6 +482,6 @@ fi
 
 if [ "$WATCH" = "true" ]; then
     echo
-    echo "Following the case (Ctrl-C stops watching; the case carries on):"
+    echo "Following the run (Ctrl-C stops watching; the run carries on):"
     exec "$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fip-status.sh" "$CASE_ID" --watch --region "$REGION"
 fi

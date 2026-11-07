@@ -29,9 +29,10 @@ Downloads the case's manifests and custody records from the evidence bucket,
 and verifies each one: unchanged since it was signed, and signed by this
 installation's key. Changes nothing in AWS.
 
-For an incident case (case-...): its log and custody records, and every
-member's manifest and run custody records; the log is also checked as a
-chain, so a missing or reordered record fails.
+For an incident case (case-...): its log and custody records, every
+member's manifest and run custody records, and the logs and custody records
+of every case merged into it. Each log is also checked as a chain, so a
+missing or reordered record fails.
 
   --out DIR   Where to put them. Default: ./<case-id>
 EOF
@@ -81,14 +82,37 @@ fetch() {  # $1 = prefix under cases/, $2 = local directory
 }
 
 CHAIN_OK=true
+CHAIN_REPORT=""
+# One incident case's log and custody records, into $2, with its log checked
+# as a chain against the case row: a record deleted, reordered or replaced
+# fails even when every remaining record verifies on its own.
+fetch_case() {  # $1 = case id, $2 = local directory
+    local id="$1" dir="$2" row logged found check
+    fetch "$id/" "$dir"
+    row="$(get_row "$id")"
+    check="$(node "$BIN_DIR/fip-case-log.mjs" "$id" "$dir/log" "$OUT/.signing-key.der")" || true
+    logged="$(jq -r '.logSeq.N // "0"' <<<"$row")"
+    found="$(jq '.records | length' <<<"$check" 2>/dev/null || echo 0)"
+    if jq -e .ok <<<"$check" >/dev/null 2>&1 && [ "$found" -ge "$logged" ]; then
+        CHAIN_REPORT+="  ok    $id: $found record(s), chained from OPENED, none missing or out of order"$'\n'
+    else
+        CHAIN_OK=false
+        CHAIN_REPORT+="$(jq -r --arg id "$id" '.problems[]? | "  FAIL  \($id): " + .' <<<"$check")"$'\n'
+        [ "$found" -ge "$logged" ] \
+            || CHAIN_REPORT+="  FAIL  $id: the case table records $logged record(s), but $found are in the bucket"$'\n'
+    fi
+}
+
 case "$CASE_ID" in
 case-*)
     # An incident case: its own log and custody records, and for every
     # member, that member's manifest and its run's custody records. The
-    # members are read from the case row; the log is then checked as a chain
-    # as well as record by record, so a deleted or reordered record shows.
+    # members are read from the case row.
     echo "Incident case $CASE_ID"
-    fetch "$CASE_ID/" "$OUT/case"
+    mkdir -p "$OUT"
+    aws kms get-public-key --profile "$ORCH_PROFILE" --region "$REGION" --key-id "$KEY_ARN" \
+        --query PublicKey --output text | base64 -d > "$OUT/.signing-key.der"
+    fetch_case "$CASE_ID" "$OUT/case"
     ROW="$(get_row "$CASE_ID")"
     MEMBERS="$(jq -r '(.members.M // {}) | to_entries[] | "\(.value.M.actionId.S) \(.value.M.instanceId.S)"' <<<"$ROW")"
     echo "Members ......... $(grep -c . <<<"$MEMBERS" || true)"
@@ -102,22 +126,25 @@ case-*)
             SEEN_RUNS="$SEEN_RUNS$run " ;;
         esac
     done <<<"$MEMBERS"
+    # Cases merged into this one, and into those, keep their own logs and
+    # custody records: a release made before a merge is recorded only there.
+    QUEUE="$(jq -r '(.mergedFrom.SS // [])[]' <<<"$ROW")"
+    SEEN_CASES=" $CASE_ID "
+    while [ -n "$QUEUE" ]; do
+        next=""
+        for merged in $QUEUE; do
+            case "$SEEN_CASES" in *" $merged "*) continue ;; esac
+            SEEN_CASES="$SEEN_CASES$merged "
+            echo "Merged in ....... $merged"
+            fetch_case "$merged" "$OUT/merged/$merged"
+            next="$next $(get_row "$merged" | jq -r '(.mergedFrom.SS // [])[]')"
+        done
+        QUEUE="$(xargs <<<"$next")"
+    done
+    rm -f "$OUT/.signing-key.der"
     echo
     echo "Case log chain:"
-    aws kms get-public-key --profile "$ORCH_PROFILE" --region "$REGION" --key-id "$KEY_ARN" \
-        --query PublicKey --output text | base64 -d > "$OUT/.signing-key.der"
-    node "$BIN_DIR/fip-case-log.mjs" "$CASE_ID" "$OUT/case/log" "$OUT/.signing-key.der" > "$OUT/.log-check.json"
-    rm -f "$OUT/.signing-key.der"
-    LOGGED="$(jq -r '.logSeq.N // "0"' <<<"$ROW")"
-    FOUND="$(jq '.records | length' "$OUT/.log-check.json")"
-    if jq -e .ok "$OUT/.log-check.json" >/dev/null && [ "$FOUND" -ge "$LOGGED" ]; then
-        echo "  ok    $FOUND record(s), chained from OPENED, none missing or out of order"
-    else
-        CHAIN_OK=false
-        jq -r '.problems[] | "  FAIL  " + .' "$OUT/.log-check.json" >&2
-        [ "$FOUND" -ge "$LOGGED" ] || echo "  FAIL  the case table records $LOGGED record(s), but $FOUND are in the bucket" >&2
-    fi
-    rm -f "$OUT/.log-check.json"
+    printf '%s' "$CHAIN_REPORT"
     echo
     ;;
 *)

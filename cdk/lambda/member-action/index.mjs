@@ -41,7 +41,7 @@ import {
   isCaseId, caseLogKey, sha256Hex, checkTicket, checkComment, buildCaseEvent,
   rowUpdateFor, signedDocument, summarizeAction, attachedMembers,
   parseMemberSpec, targetsOfAction, locateMember, memberId, moveTransaction, mergeTransaction,
-  REQUIRED_STATE, shareState, custodyOf, closeBlockers,
+  REQUIRED_STATE, shareState, custodyOf, closeBlockers, runIncidents,
 } from './case-log.mjs';
 
 const REGION = process.env.AWS_REGION;
@@ -1048,6 +1048,18 @@ async function releaseToAnalysis(event, creds) {
   }
   if (!copies.length) {
     throw new Error(`case ${caseId} has no evidence copies to ${revoke ? 'revoke' : 'release'}`);
+  }
+
+  // A run whose targets are in an incident case is released through that
+  // case, so the release is in the case's log and a closed case stays closed.
+  // Runs in no case, including every run made before cases existed, go on
+  // below exactly as before.
+  const runRow = await readCaseRow(new DynamoDBClient({ region: REGION, credentials: creds }), caseId);
+  const incidents = runIncidents(runRow);
+  if (incidents.length) {
+    throw new Error(`run ${caseId} is in incident case ${incidents.join(', ')}; `
+      + `${revoke ? 'revoke' : 'release'} it through the case: fip release --case ${incidents[0]}`
+      + `${revoke ? ' --revoke' : ''}`);
   }
 
   const ec2 = ec2For(creds);

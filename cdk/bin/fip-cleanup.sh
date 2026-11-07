@@ -83,11 +83,12 @@ if [ "$ACTION" = "list" ]; then
             --tag-filters Key=application,Values=fipv2 --output json \
           | jq -r '.ResourceTagMappingList
               | map({arn: .ResourceARN, tags: (.Tags | from_entries)})
-              | sort_by(.tags["fip:class"] // "", .arn)[]
-              | "  \((.tags["fip:class"] // "-") | . + " " * (15 - length)) \(.arn)"' \
+              | sort_by(.tags["fip:class"] // "", .tags["fip:case"] // "", .arn)[]
+              | "  \((.tags["fip:class"] // "-") | . + " " * (15 - length)) \((.tags["fip:case"] // "-") | . + " " * (32 - length)) \(.arn)"' \
           || echo "  (could not list: check the profile signs in)"
         echo
     done
+    echo "Columns: class, incident case (fip:case, '-' for none), resource."
     echo "Classes: infrastructure = the stacks and what they hold; evidence = from a real"
     echo "case, never removed by FIP; test = may be removed with: fip cleanup --test"
     echo "Some resource types, IAM roles among them, are not listed by this API."
@@ -155,4 +156,4 @@ while IFS=$'\t' read -r kind id profile rid _ <&3; do
 done 3< "$PLAN"
 
 [ "$FAILED" -eq 0 ] || { echo "Some items were not removed (above)." >&2; exit 1; }
-echo "Done. The isolation security group is left: it is free and the next case reuses it."
+echo "Done. The isolation security group is left: it is free and the next isolation reuses it."
