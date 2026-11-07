@@ -709,10 +709,12 @@ fip evidence <run-id | case-id | --ticket T> [--out DIR]
 ```
 
 **Given an incident case**, it downloads the case's log and custody records into
-`case/`, and each member's manifest and its run's custody records into
-`members/<run>/`, and verifies every one. It also checks the case log as a **chain**:
-a record deleted, reordered or replaced fails even when each remaining record verifies
-on its own.
+`case/`, each member's manifest and its run's custody records into `members/<run>/`,
+and the log and custody records of every case merged into it, however many merges
+back, into `merged/<case>/`. A release made before a merge is recorded only in the
+merged case, so those records belong to the evidence. It verifies every one, and checks
+each case log as a **chain**: a record deleted, reordered or replaced fails even when
+each remaining record verifies on its own.
 
 **Given an isolation run**, it downloads the run's manifests and custody records into
 `./<run-id>`, or `--out DIR`, and verifies each as `fip verify --ours` does. Either way
@@ -777,7 +779,10 @@ revoke is a signed custody record under the case, an entry on each member's run,
 `RELEASED` or `REVOKED` record in the case log. A closed case releases nothing; reopen
 it first. A revoke is always allowed.
 
-**Given an isolation run**, it does the same for that run's evidence alone.
+**Given an isolation run**, it does the same for that run's evidence alone, but only
+for a run in no case. A run whose hosts are in an incident case is refused, with the
+case to use instead, so that every release is in the case's log and a closed case stays
+closed.
 
 Either way it gives an analysis account (§10) a share of each evidence snapshot and a
 KMS grant on the forensic key. It needs both: a shared encrypted snapshot cannot be

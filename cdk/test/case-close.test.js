@@ -101,3 +101,23 @@ describe('closing', () => {
     }
   });
 });
+
+test('runIncidents: the cases a run is in, from its cases map and its incident', async () => {
+  const { runIncidents } = await import('../lambda/member-action/case-log.mjs');
+  assert.deepEqual(runIncidents(null), []);
+  assert.deepEqual(runIncidents({ caseId: { S: 'fip-x' } }), []);
+  assert.deepEqual(runIncidents({ cases: { M: {} } }), []);
+  assert.deepEqual(runIncidents({ incident: { S: 'case-b' } }), ['case-b']);
+  // Moved out of the case it was isolated into: the map wins.
+  assert.deepEqual(
+    runIncidents({ incident: { S: 'case-b' }, targets: { M: { 'i-1': {} } }, cases: { M: { 'i-1': { S: 'case-a' } } } }),
+    ['case-a'],
+  );
+  // One target moved, one not yet in the map: each where it is.
+  assert.deepEqual(
+    runIncidents({ incident: { S: 'case-b' }, targets: { M: { 'i-1': {}, 'i-2': {} } }, cases: { M: { 'i-1': { S: 'case-a' } } } }),
+    ['case-a', 'case-b'],
+  );
+  // In no case at all.
+  assert.deepEqual(runIncidents({ targets: { M: { 'i-1': {} } }, cases: { M: {} } }), []);
+});

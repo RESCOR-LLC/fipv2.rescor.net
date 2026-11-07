@@ -296,6 +296,25 @@ export function locateMember(actionRow, instanceId, incidentRow = null) {
   return { caseId: null, recorded: false };
 }
 
+/**
+ * The incident cases any target of a run is in now, sorted. Per target, the
+ * `cases` map says where it is; a target the map does not name is still in
+ * the case it was isolated into (`incident`), because a member never leaves
+ * every case: a move always names a destination.
+ */
+export function runIncidents(actionRow) {
+  const map = actionRow?.cases?.M ?? {};
+  const incident = actionRow?.incident?.S ?? null;
+  const instances = new Set([...Object.keys(actionRow?.targets?.M ?? {}), ...Object.keys(map)]);
+  const found = new Set();
+  for (const i of instances) {
+    const where = map[i]?.S ?? incident;
+    if (where) found.add(where);
+  }
+  if (!instances.size && incident) found.add(incident);
+  return [...found].sort();
+}
+
 const memberEntry = (m, { seq, at, key }) => ({
   M: {
     actionId: { S: m.actionId },

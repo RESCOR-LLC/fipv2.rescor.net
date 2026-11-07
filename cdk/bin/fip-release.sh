@@ -208,6 +208,21 @@ if [ "$(jq -r 'has("Item")' <<<"$CASE_ROW")" != "true" ]; then
     exit 1
 fi
 
+# A run in an incident case is released through the case, so the release is
+# in the case's log and a closed case stays closed. The Lambda refuses too.
+# Per target: the cases map, else the case it was isolated into.
+IN_CASES="$(jq -r '.Item as $r | ($r.cases.M // {}) as $m | ($r.incident.S // null) as $inc
+                   | ((($r.targets.M // {}) | keys) + ($m | keys) | unique) as $ids
+                   | (if ($ids | length) == 0 then [$inc] else [$ids[] | $m[.].S // $inc] end)
+                   | map(select(. != null and . != "")) | unique | join(", ")' <<<"$CASE_ROW")"
+if [ -n "$IN_CASES" ]; then
+    echo "ERROR: run $CASE_ID is in incident case $IN_CASES." >&2
+    hint="fip release --case ${IN_CASES%%,*} --to $ANALYSIS_ACCOUNT"
+    [ "$REVOKE" = "true" ] && hint="$hint --revoke"
+    echo "       Release or revoke it through the case: $hint" >&2
+    exit 1
+fi
+
 CASE_STATE="$(jq -r '.Item.state.S // "unknown"' <<<"$CASE_ROW")"
 SNAPSHOTS="$(jq -r '[.Item.targets.M // {} | to_entries[]
                      | .value.M.evidenceSnapshots.SS // [] | .[]]

@@ -156,4 +156,4 @@ while IFS=$'\t' read -r kind id profile rid _ <&3; do
 done 3< "$PLAN"
 
 [ "$FAILED" -eq 0 ] || { echo "Some items were not removed (above)." >&2; exit 1; }
-echo "Done. The isolation security group is left: it is free and the next case reuses it."
+echo "Done. The isolation security group is left: it is free and the next isolation reuses it."
