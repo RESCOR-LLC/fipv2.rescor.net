@@ -162,7 +162,8 @@ new FipMemberStack(app, 'FipMemberStack', {
   // and self-managed StackSets. This stack has no assets, so the rule buys
   // nothing and costs the property the committed template exists for.
   synthesizer: new DefaultStackSynthesizer({ generateBootstrapVersionRule: false }),
-  orgId,
+  // No orgId: the organization is the OrganizationId parameter, so the one
+  // committed template serves every install.
   orchestratorAccountId: process.env.FIP_ORCHESTRATOR_ACCOUNT_ID || '',
   description: 'FIP member-account payload — FipInventoryRole (read-only) only',
 });

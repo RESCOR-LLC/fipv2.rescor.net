@@ -203,8 +203,6 @@ class FipMemberStack extends Stack {
     super(scope, id, props);
     tagStack(this, 'member');  // application=fipv2 and fip:class (lib/fip-tags.js)
 
-    const { orgId = null } = props;
-
     const orchestratorAccountId = new CfnParameter(this, 'OrchestratorAccountId', {
       type: 'String',
       description:
@@ -260,15 +258,35 @@ class FipMemberStack extends Stack {
         'At least 16 characters, alphanumeric plus + = , . @ : / - and no spaces.',
     });
 
+    // Defense in depth when the customer has an organization: the
+    // orchestrator's caller must also be inside it. A parameter, not synth
+    // context, because this one template serves every install: as context it
+    // was baked out of the committed template, and members deployed from it
+    // silently lacked the condition. No default, so a deploy that forgets it
+    // fails. "none" is the explicit choice for an install with no
+    // organization, where the external ID and the named account carry the
+    // guard alone; requiring an organization would be imposing one.
+    const organizationId = new CfnParameter(this, 'OrganizationId', {
+      type: 'String',
+      description:
+        'Your AWS Organizations id (o-...), required of the orchestrator as ' +
+        'aws:PrincipalOrgID on every assume. The word none only if you have ' +
+        'no organization.',
+      allowedPattern: '^(o-[a-z0-9]{10,32}|none)$',
+      constraintDescription: 'An organization id (o-...), or the word none.',
+    });
+    const hasOrganization = new CfnCondition(this, 'HasOrganization', {
+      expression: Fn.conditionNot(Fn.conditionEquals(organizationId.valueAsString, 'none')),
+    });
+
     const conditions = {
-      StringEquals: { 'sts:ExternalId': externalId.valueAsString },
+      StringEquals: {
+        'sts:ExternalId': externalId.valueAsString,
+        'aws:PrincipalOrgID': Fn.conditionIf(
+          hasOrganization.logicalId, organizationId.valueAsString, Aws.NO_VALUE,
+        ),
+      },
     };
-    // Defense in depth when the customer has an organization. Its absence
-    // weakens the guard to external-ID-plus-named-account; it does not
-    // stop FIP working, because requiring an org would be imposing one.
-    if (orgId) {
-      conditions.StringEquals['aws:PrincipalOrgID'] = orgId;
-    }
 
     const inventoryRole = new iam.Role(this, 'FipInventoryRole', {
       roleName: 'FipInventoryRole',
