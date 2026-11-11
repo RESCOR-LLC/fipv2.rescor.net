@@ -71,6 +71,10 @@ class FipAnalysisStack extends Stack {
       // carry the trust on that path. Empty is valid: deploy the
       // workstation first, name the examiners when you engage them.
       examinerPrincipalArns = [],
+      // Who may READ examination results, from outside the VPC. ARNs for the
+      // same reason as the examiners. Empty is valid: name them when the
+      // results are wanted.
+      resultsReaderPrincipalArns = [],
     } = props;
 
     // ── Network: private, and that is the whole design ────────────────
@@ -155,7 +159,9 @@ class FipAnalysisStack extends Stack {
     // Session logs go to S3 and KMS is reached for the volume keys. Gateway
     // endpoints are free, so these cost nothing to add and failing to add
     // them is a confusing outage rather than a bill.
-    vpc.addGatewayEndpoint('S3Endpoint', { service: ec2.GatewayVpcEndpointAwsService.S3 });
+    const s3Endpoint = vpc.addGatewayEndpoint('S3Endpoint', {
+      service: ec2.GatewayVpcEndpointAwsService.S3,
+    });
     vpc.addInterfaceEndpoint('KmsEndpoint', {
       service: ec2.InterfaceVpcEndpointAwsService.KMS,
       privateDnsEnabled: true,
@@ -460,6 +466,121 @@ class FipAnalysisStack extends Stack {
       resources: ['*'],
     }));
 
+    // ── Results out ───────────────────────────────────────────────────
+    // The VPC has no route off it, so findings leave the same way the session
+    // transcripts do: over the S3 gateway endpoint, into a bucket the examiner
+    // can add to but not alter. Readers sit outside the VPC and only read.
+    //
+    // Deliberately NOT a results snapshot. The examiner role cannot create
+    // snapshots (a snapshot made here would look like evidence and have no
+    // manifest), and a results path must not reopen that.
+    //
+    // Its own key, not the session key: a results reader must be able to
+    // decrypt results without being able to decrypt session transcripts.
+    const resultsKey = new kms.Key(this, 'FipResultsKey', {
+      alias: 'alias/fip-analysis-results',
+      description: 'Encrypts examination results written from the FIP analysis workstation',
+      enableKeyRotation: true,
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
+
+    const resultsBucket = new s3.Bucket(this, 'FipResults', {
+      bucketName: `fip-analysis-results-${this.account}-${this.region}`,
+      serverAccessLogsBucket: sessionAccessLogs,
+      serverAccessLogsPrefix: 'results-bucket-access/',
+      // Object Lock enabled at creation, nothing locked by default: the
+      // standing rule for every FIP bucket. Results may become part of the
+      // record, and Object Lock cannot be added later. Versioning (required
+      // by Object Lock) means an overwrite keeps the earlier version.
+      objectLockEnabled: true,
+      versioned: true,
+      encryption: s3.BucketEncryption.KMS,
+      encryptionKey: resultsKey,
+      bucketKeyEnabled: true,
+      enforceSSL: true,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
+
+    // Writes arrive ONLY through this VPC's S3 endpoint. A results object is
+    // worth something because it came from the logged workstation; a write
+    // from anywhere else, even by an administrator, would break that claim.
+    resultsBucket.addToResourcePolicy(new iam.PolicyStatement({
+      sid: 'WritesOnlyFromTheAnalysisVpc',
+      effect: iam.Effect.DENY,
+      principals: [new iam.AnyPrincipal()],
+      actions: ['s3:PutObject'],
+      resources: [resultsBucket.arnForObjects('*')],
+      conditions: { StringNotEquals: { 'aws:SourceVpce': s3Endpoint.vpcEndpointId } },
+    }));
+
+    // Append only, as with the transcripts: no delete, no read-back. The
+    // examiner holds a shell on the workstation and therefore this role.
+    workstationRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'WriteResultsAppendOnly',
+      actions: ['s3:PutObject'],
+      resources: [resultsBucket.arnForObjects('results/*')],
+    }));
+    resultsKey.grant(workstationRole, 'kms:Encrypt', 'kms:GenerateDataKey', 'kms:DescribeKey');
+    // A multipart upload under SSE-KMS needs kms:Decrypt to assemble the
+    // parts, and `aws s3 cp` switches to multipart above 8 MB. Confined to S3
+    // acting on this bucket, and the role has no s3:GetObject here, so it
+    // still cannot read a result back.
+    workstationRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'AssembleMultipartResultsOnly',
+      actions: ['kms:Decrypt'],
+      resources: [resultsKey.keyArn],
+      conditions: {
+        StringEquals: { 'kms:ViaService': `s3.${this.region}.amazonaws.com` },
+        // The bucket ARN with an S3 Bucket Key, the object ARN without one.
+        StringLike: {
+          'kms:EncryptionContext:aws:s3:arn': [
+            resultsBucket.bucketArn, resultsBucket.arnForObjects('results/*'),
+          ],
+        },
+      },
+    }));
+
+    const resultsReaderRole = new iam.Role(this, 'FipResultsReaderRole', {
+      roleName: 'FipResultsReader',
+      description: 'Reads examination results from outside the analysis VPC. Read only.',
+      assumedBy: resultsReaderPrincipalArns.length
+        ? new iam.CompositePrincipal(
+          ...resultsReaderPrincipalArns.map((arn) => new iam.ArnPrincipal(arn)),
+        )
+        // Self-trust placeholder, as for the examiner role.
+        : new iam.AccountPrincipal(this.account),
+      maxSessionDuration: Duration.hours(1),
+    });
+    resultsReaderRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'ReadResults',
+      actions: ['s3:GetObject', 's3:GetObjectVersion', 's3:GetObjectRetention', 's3:GetObjectLegalHold'],
+      resources: [resultsBucket.arnForObjects('results/*')],
+    }));
+    resultsReaderRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'ListResults',
+      actions: ['s3:ListBucket', 's3:ListBucketVersions'],
+      resources: [resultsBucket.bucketArn],
+    }));
+    resultsKey.grantDecrypt(resultsReaderRole);
+    resultsReaderRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'NeverAlterResults',
+      effect: iam.Effect.DENY,
+      actions: [
+        's3:PutObject', 's3:DeleteObject', 's3:DeleteObjectVersion',
+        's3:PutObjectRetention', 's3:PutObjectLegalHold', 's3:BypassGovernanceRetention',
+        's3:PutBucketPolicy', 's3:PutLifecycleConfiguration',
+        'kms:DisableKey', 'kms:ScheduleKeyDeletion',
+      ],
+      resources: ['*'],
+    }));
+
+    new CfnOutput(this, 'ResultsBucket', {
+      value: resultsBucket.bucketName,
+      description: 'Write from the workstation: aws s3 cp <file> s3://<this>/results/<case>/ --checksum-algorithm SHA256',
+    });
+    new CfnOutput(this, 'ResultsReaderRoleArn', { value: resultsReaderRole.roleArn });
+
     new CfnOutput(this, 'WorkstationInstanceId', {
       value: workstation.instanceId,
       description: 'Connect with: aws ssm start-session --document-name FipForensicSession --target <this>',
@@ -477,6 +598,7 @@ class FipAnalysisStack extends Stack {
     this.workstation = workstation;
     this.examinerRole = examinerRole;
     this.sessionLogBucket = sessionLogBucket;
+    this.resultsBucket = resultsBucket;
     this.orgId = orgId;
   }
 }

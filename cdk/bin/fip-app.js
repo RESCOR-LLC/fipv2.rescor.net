@@ -143,6 +143,11 @@ if (process.env.FIP_ANALYSIS_ACCOUNT_ID) {
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean),
+    // ARNs of the principals who may read results from outside the VPC.
+    resultsReaderPrincipalArns: (app.node.tryGetContext('fip:resultsReaderPrincipalArns') || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
     description:
       'FIP analysis account — isolated VPC, Session Manager workstation, examiner role. No bastion.',
   });
@@ -440,9 +445,11 @@ if (app.node.tryGetContext('fip:nag') === 'true') {
           'instance and therefore its role — delete the transcript of the session they ' +
           'are in. The kms wildcards are CDK\'s own grant expansion against a single ' +
           'named key, and this role can Encrypt but not Decrypt, so it cannot read ' +
-          'back another session.',
+          'back another session. Results are the same shape: s3:PutObject only, on ' +
+          'the results/ prefix of the results bucket, with no read-back and no delete.',
         appliesTo: [
           'Resource::<FipSessionLogs1E41B5D5.Arn>/sessions/*',
+          { regex: String.raw`/^Resource::<FipResults[0-9A-F]+\.Arn>\/results\/\*$/g` },
           'Action::kms:GenerateDataKey*',
           { regex: String.raw`/^Resource::<FipSessionLogGroup.*\.Arn>.*$/g` },
         ],
@@ -467,6 +474,22 @@ if (app.node.tryGetContext('fip:nag') === 'true') {
         appliesTo: [
           'Resource::*',
           { regex: String.raw`/^Resource::arn:<AWS::Partition>:ssm:.*:session/.*\*$/g` },
+        ],
+      }],
+    );
+
+    NagSuppressions.addResourceSuppressionsByPath(
+      analysis,
+      '/FipAnalysisStack/FipResultsReaderRole/DefaultPolicy/Resource',
+      [{
+        id: 'AwsSolutions-IAM5',
+        reason:
+          'Read-only: s3:Get* on the results/ prefix of the one results bucket, whose ' +
+          'object names are written by the examiner and cannot be known at deploy time. ' +
+          'The role carries an explicit Deny on every write, delete and retention ' +
+          'change; test/fip-analysis-stack.test.js asserts it.',
+        appliesTo: [
+          { regex: String.raw`/^Resource::<FipResults[0-9A-F]+\.Arn>\/results\/\*$/g` },
         ],
       }],
     );
