@@ -1280,6 +1280,33 @@ mount -o ro,noexec,nodev,noload /dev/nvme1n1p1 /mnt/evidence
 `noload` matters on ext3/ext4: without it the kernel replays the journal, **writing to
 the volume you are treating as evidence**. `ro` alone does not prevent that.
 
+### Get results out
+
+The VPC has no route out, so findings leave the way the session transcripts do: over the
+VPC's S3 gateway endpoint, into the **results bucket** (stack output `ResultsBucket`). From
+the workstation:
+
+```sh
+aws s3 cp findings.tar.gz s3://<results bucket>/results/<case id>/ --checksum-algorithm SHA256
+```
+
+| | |
+|---|---|
+| Write | The workstation can **add** objects under `results/` and nothing else: no read-back, no delete. The bucket refuses any write that does not arrive through this VPC's S3 endpoint, an administrator's included |
+| Keep | Object Lock is enabled and versioning is on, so an overwrite keeps the earlier version. Nothing is locked by default; set a retention or legal hold on an object if it becomes part of the record |
+| Key | Results have their own KMS key, separate from the transcript key, so a reader of results cannot read session transcripts |
+| Read | The `FipResultsReader` role (stack output `ResultsReaderRoleArn`) reads and lists results from outside the VPC, and is denied every write, delete and retention change |
+
+Name who may read results the same way as examiners:
+
+```sh
+cdk deploy FipAnalysisStack --context fip:resultsReaderPrincipalArns=arn:aws:iam::999988887777:role/Counsel
+```
+
+Until you do, the role trusts only the analysis account itself. Results do **not** go back
+through a snapshot: the examiner cannot create one, because a snapshot made here would sit
+beside the evidence with no manifest and no provenance.
+
 ### Cost, and turning it off
 
 Four interface endpoints and the workstation bill hourly whether or not anyone is

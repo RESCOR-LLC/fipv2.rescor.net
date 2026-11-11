@@ -173,8 +173,10 @@ describe('the session is recorded, and the examiner cannot stop it', () => {
 
   test('the session log bucket has Object Lock enabled and nothing locked', () => {
     const buckets = synth().findResources('AWS::S3::Bucket');
-    const sessionBucket = Object.values(buckets).find(
-      (r) => r.Properties.ObjectLockEnabled === true);
+    const sessionBucket = Object.entries(buckets).find(
+      ([name]) => /^FipSessionLogs/.test(name))?.[1];
+    assert.strictEqual(sessionBucket?.Properties.ObjectLockEnabled, true,
+      'Object Lock must be ENABLED at creation on the session bucket');
     assert.ok(
       sessionBucket,
       'Object Lock must be ENABLED at creation: a transcript may become part of ' +
@@ -215,15 +217,16 @@ describe('the session is recorded, and the examiner cannot stop it', () => {
       workstationStatements.push(...res.Properties.PolicyDocument.Statement);
     }
     assert.ok(workstationStatements.length > 0, 'expected workstation policy statements');
+    const onSessionKey = (st) => /FipSessionLogKey/.test(JSON.stringify(st.Resource ?? ''));
     const actions = workstationStatements
-      .filter((st) => st.Effect !== 'Deny')
+      .filter((st) => st.Effect !== 'Deny' && onSessionKey(st))
       .flatMap((st) => [].concat(st.Action ?? []))
       .filter((a) => typeof a === 'string');
     assert.ok(actions.some((a) => a === 'kms:Encrypt'), 'must be able to encrypt');
     assert.ok(
       !actions.includes('kms:Decrypt'),
-      'kms:Decrypt is not needed to WRITE a transcript, and granting it would let ' +
-      'the examiner read back other examiners\' sessions.',
+      'kms:Decrypt on the session key is not needed to WRITE a transcript, and ' +
+      'granting it would let the examiner read back other examiners\' sessions.',
     );
   });
 
@@ -407,5 +410,88 @@ describe('the examiner can use released evidence, and only use it', () => {
       'a volume created in another region would sit outside the flow logs, session ' +
       'transcripts and endpoint boundary this account establishes',
     );
+  });
+});
+
+describe('results leave over the S3 endpoint, append-only', () => {
+  function resultsBucket(t = synth()) {
+    const found = Object.entries(t.findResources('AWS::S3::Bucket'))
+      .find(([name]) => /^FipResults/.test(name));
+    assert.ok(found, 'expected a results bucket');
+    return found;
+  }
+  function statementsOf(t, rolePattern) {
+    const out = [];
+    for (const [name, res] of Object.entries(t.findResources('AWS::IAM::Policy'))) {
+      if (rolePattern.test(name)) out.push(...res.Properties.PolicyDocument.Statement);
+    }
+    return out;
+  }
+
+  test('the results bucket has Object Lock, KMS, and nothing locked by default', () => {
+    const [, bucket] = resultsBucket();
+    assert.strictEqual(bucket.Properties.ObjectLockEnabled, true,
+      'results may become part of the record; Object Lock cannot be added later');
+    assert.ok(!bucket.Properties.ObjectLockConfiguration?.Rule, 'no default retention');
+    const sse = bucket.Properties.BucketEncryption.ServerSideEncryptionConfiguration[0];
+    assert.strictEqual(sse.ServerSideEncryptionByDefault.SSEAlgorithm, 'aws:kms');
+    assert.match(JSON.stringify(sse), /FipResultsKey/,
+      'results need their own key: a reader must not be able to decrypt transcripts');
+  });
+
+  test('writes are refused unless they come through the VPC S3 endpoint', () => {
+    const t = synth();
+    const [name] = resultsBucket(t);
+    const policy = Object.values(t.findResources('AWS::S3::BucketPolicy'))
+      .find((p) => JSON.stringify(p.Properties.Bucket).includes(name));
+    assert.ok(policy, 'expected a results bucket policy');
+    const deny = policy.Properties.PolicyDocument.Statement.find(
+      (st) => st.Effect === 'Deny' && [].concat(st.Action).includes('s3:PutObject'));
+    assert.ok(deny, 'expected a Deny on s3:PutObject');
+    assert.match(JSON.stringify(deny.Condition), /aws:SourceVpce.*S3Endpoint/,
+      'a result is only worth something if it came from the logged workstation');
+  });
+
+  test('the workstation can write results but not read or delete them', () => {
+    const t = synth();
+    const allow = statementsOf(t, /Workstation/).filter((st) => st.Effect !== 'Deny');
+    const onResults = allow.filter((st) => /FipResults[0-9A-F]/.test(JSON.stringify(st.Resource)));
+    const actions = onResults.flatMap((st) => [].concat(st.Action));
+    assert.ok(actions.includes('s3:PutObject'), 'must be able to write results');
+    for (const forbidden of ['s3:GetObject', 's3:DeleteObject', 's3:DeleteObjectVersion']) {
+      assert.ok(!actions.includes(forbidden), `${forbidden} on results is granted`);
+    }
+  });
+
+  test('the workstation\'s kms:Decrypt on the results key is confined to S3', () => {
+    const decrypt = statementsOf(synth(), /Workstation/).filter(
+      (st) => st.Effect !== 'Deny' && [].concat(st.Action).includes('kms:Decrypt'));
+    for (const st of decrypt) {
+      assert.match(JSON.stringify(st.Resource), /FipResultsKey/,
+        'the only Decrypt the workstation holds is on the results key');
+      assert.ok(st.Condition?.StringEquals?.['kms:ViaService'],
+        'Decrypt must be confined to S3 assembling a multipart upload');
+    }
+  });
+
+  test('readers read, and are denied every way of altering results', () => {
+    const t = synth();
+    const st = statementsOf(t, /ResultsReader/);
+    const allow = st.filter((s) => s.Effect !== 'Deny').flatMap((s) => [].concat(s.Action));
+    const deny = st.filter((s) => s.Effect === 'Deny').flatMap((s) => [].concat(s.Action));
+    assert.ok(allow.includes('s3:GetObject'));
+    assert.ok(allow.includes('kms:Decrypt'));
+    for (const a of ['s3:PutObject', 's3:DeleteObject', 's3:DeleteObjectVersion', 's3:BypassGovernanceRetention']) {
+      assert.ok(!allow.includes(a), `${a} is granted to readers`);
+      assert.ok(deny.includes(a), `${a} is not denied to readers`);
+    }
+  });
+
+  test('named results readers land in the trust policy', () => {
+    const arn = 'arn:aws:iam::999988887777:role/OutsideReader';
+    const roles = synth({ resultsReaderPrincipalArns: [arn] }).findResources('AWS::IAM::Role');
+    const reader = Object.entries(roles).find(([name]) => /ResultsReader/.test(name));
+    assert.ok(reader, 'expected a results reader role');
+    assert.ok(JSON.stringify(reader[1].Properties.AssumeRolePolicyDocument).includes(arn));
   });
 });
