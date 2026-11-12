@@ -8,7 +8,7 @@
  *
  * Scope note: this models what is BUILT. Memory capture, detonation,
  * automatic triggering and automated evidence delivery into the analysis
- * account are designed but not implemented, and are deliberately absent —
+ * account are not implemented, and are deliberately absent —
  * see docs/MANUAL.md §13.
  */
 workspace "FIP" "Forensic Isolation Program — acquire, isolate and attest EC2 evidence" {
@@ -65,11 +65,14 @@ workspace "FIP" "Forensic Isolation Program — acquire, isolate and attest EC2 
 
             group "Analysis Account (optional, may be a third party's)" {
                 analysisVpc    = container "Isolated VPC" "Private subnets only. No internet gateway, no NAT, NO ROUTE off the VPC - so evidence that executes cannot phone home." "Amazon VPC" "Network"
-                ssmEndpoints   = container "SSM Interface Endpoints" "ssm, ssmmessages, ec2messages. The only things the workstation can reach." "VPC Endpoints" "Network"
+                ssmEndpoints   = container "VPC Endpoints" "Interface: ssm, ssmmessages, ec2messages, logs, kms. Gateway: S3, limited to this account's buckets and the AWS package and agent buckets. The only things the workstation can reach." "VPC Endpoints" "Network"
                 workstation    = container "Examiner Workstation" "No public IP, no inbound rules, NO KEY PAIR. Reached only by Session Manager." "EC2 (Amazon Linux 2023)" "Compute"
                 sessionDoc     = container "FipForensicSession" "Custom Session document carrying the logging config. The account default is never overwritten." "SSM Document" "Identity"
                 sessionLogs    = container "Session Transcripts" "Keystroke-level, to S3 and CloudWatch, KMS-encrypted. The examiner cannot delete from it." "Amazon S3 + CloudWatch Logs" "Store"
                 examinerRole   = container "FipExaminerRole" "Opens a logged session on ONE instance with ONE document. Denied every route to altering the audit trail." "IAM Role" "Identity"
+                toolsBucket    = container "Tools Bucket" "Examiners upload tools from outside the VPC; the workstation can only read. Refuses any write through the VPC. Versioned." "Amazon S3" "Store"
+                resultsBucket  = container "Results Bucket" "Findings out. Add-only under results/, accepted only through this VPC's S3 endpoint. Object Lock enabled, its own KMS key." "Amazon S3" "Store"
+                resultsReader  = container "FipResultsReader" "Reads results from outside the VPC. Denied every write, delete and retention change." "IAM Role" "Identity"
             }
 
             group "Member Account (deployed into each)" {
@@ -115,7 +118,7 @@ workspace "FIP" "Forensic Isolation Program — acquire, isolate and attest EC2 
         responder -> custody "bin/fip-release.sh - a deliberate chain-of-custody decision, never automatic"
         custody -> evidenceBucket "Writes a SIGNED custody record. A revoke never erases a release."
         custody -> caseTable "Appends a custody entry"
-        custody -> evidenceKey "Grants Decrypt to the analysis account, or retires the grant"
+        custody -> evidenceKey "Grants Decrypt and ReEncryptFrom to the analysis account, or retires the grant"
         custody -> workstation "Shares the evidence snapshots so volumes can be created from them"
         custody -> credentials "evidence"
 
@@ -125,6 +128,11 @@ workspace "FIP" "Forensic Isolation Program — acquire, isolate and attest EC2 
         workstation -> ssmEndpoints "Dials OUT over HTTPS. Nothing dials in."
         workstation -> analysisVpc "Runs in a private isolated subnet"
         workstation -> sessionLogs "Appends the transcript. Cannot delete or decrypt it."
+        examiner -> toolsBucket "Uploads tools from outside the VPC"
+        workstation -> toolsBucket "Reads tools through the S3 endpoint"
+        workstation -> resultsBucket "Adds findings through the S3 endpoint. No read-back, no delete."
+        examiner -> resultsReader "Assumes to read findings"
+        resultsReader -> resultsBucket "Reads and lists"
 
         # --- component relationships (inside member-action) ---
         stateMachine -> tagging "action=tag"

@@ -20,10 +20,12 @@ ROLE=<a role you can assume into those accounts>   # e.g. OrganizationAccountAcc
 cd cdk
 npm ci
 npm test                                  # assertions on the design decisions
-source ./bin/discover-accounts.sh         # or just export the account ids
-npx cdk bootstrap aws://$EVIDENCE/$REGION # only if CDKToolkit is absent
-npx cdk deploy FipCoreStack FipOrchestratorStack
+./bin/fip deploy                          # reads ~/.fip/install.env (manual §3)
 ```
+
+`fip deploy` bootstraps where needed and passes the organization id and tags. A bare
+`cdk deploy` does neither, and without the organization id the stacks lose their
+organization conditions.
 
 Nothing here depends on prior state. If every resource below were deleted this
 recreates all of it — except the bucket-name reuse window in step 3.
@@ -86,7 +88,18 @@ relied on a grant — an Auto Scaling service-linked role launching encrypted vo
 for instance — fails with `Client.InvalidKMSKey.InvalidState` until the grant is
 recreated, and the error does not mention grants.
 
-### 5. Member accounts
+### 5. Analysis account
+
+`FipAnalysisStack` is separate and lives in the analysis account. Follow the manual,
+§10 "Keep it or remove it": withdraw any release first, turn off the workstation's
+termination protection, then `cdk destroy`. The destroy keeps the session transcript,
+results, tools and access-log buckets, the session and flow-log log groups, and three
+keys (`alias/fip-analysis-session-logs`, `alias/fip-analysis-session-channel`,
+`alias/fip-analysis-results`). They have fixed names, so the stack cannot be deployed
+again in that account and region until they are gone; remove them as in steps 3 and 4
+once the record no longer needs them.
+
+### 6. Member accounts
 
 `FipMemberStack` is separate and lives in each member account. Delete the stack there;
 it removes only the two roles and the permissions boundary. It does **not** remove:

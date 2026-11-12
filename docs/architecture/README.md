@@ -15,7 +15,7 @@ designed but not implemented, and are deliberately absent — see
 
 One absence in the model is itself a decision: **nothing connects the state machines to
 Evidence Release.** Releasing a case's evidence to the analysis account is reachable only
-from a human running `bin/fip-release.sh`, because the analysis account may belong to a
+from a human running `fip release`, because the analysis account may belong to a
 third party and evidence must not reach an outside party as a side effect of a case being
 opened.
 
@@ -114,7 +114,7 @@ graph LR
 
         29["<div style='font-weight: bold'>Isolated VPC</div><div style='font-size: 70%; margin-top: 0px'>[Container: Amazon VPC]</div><div style='font-size: 80%; margin-top:10px'>Private subnets only. No<br />internet gateway, no NAT, NO<br />ROUTE off the VPC - so<br />evidence that executes cannot<br />phone home.</div>"]
         style 29 fill:#5b9bd5,stroke:#3f6c95,color:#ffffff
-        30["<div style='font-weight: bold'>SSM Interface Endpoints</div><div style='font-size: 70%; margin-top: 0px'>[Container: VPC Endpoints]</div><div style='font-size: 80%; margin-top:10px'>ssm, ssmmessages,<br />ec2messages. The only things<br />the workstation can reach.</div>"]
+        30["<div style='font-weight: bold'>VPC Endpoints</div><div style='font-size: 70%; margin-top: 0px'>[Container: VPC Endpoints]</div><div style='font-size: 80%; margin-top:10px'>Interface: ssm, ssmmessages,<br />ec2messages, logs, kms.<br />Gateway: S3, limited to this<br />account's buckets and the AWS<br />package and agent buckets.<br />The only things the<br />workstation can reach.</div>"]
         style 30 fill:#5b9bd5,stroke:#3f6c95,color:#ffffff
         31["<div style='font-weight: bold'>Examiner Workstation</div><div style='font-size: 70%; margin-top: 0px'>[Container: EC2 (Amazon Linux 2023)]</div><div style='font-size: 80%; margin-top:10px'>No public IP, no inbound<br />rules, NO KEY PAIR. Reached<br />only by Session Manager.</div>"]
         style 31 fill:#2e75b6,stroke:#20517f,color:#ffffff
@@ -124,6 +124,12 @@ graph LR
         style 33 fill:#548235,stroke:#3a5b25,color:#ffffff
         34("<div style='font-weight: bold'>FipExaminerRole</div><div style='font-size: 70%; margin-top: 0px'>[Container: IAM Role]</div><div style='font-size: 80%; margin-top:10px'>Opens a logged session on ONE<br />instance with ONE document.<br />Denied every route to<br />altering the audit trail.</div>")
         style 34 fill:#bf8f00,stroke:#856400,color:#ffffff
+        38[("<div style='font-weight: bold'>Tools Bucket</div><div style='font-size: 70%; margin-top: 0px'>[Container: Amazon S3]</div><div style='font-size: 80%; margin-top:10px'>Examiners upload tools from<br />outside the VPC; the<br />workstation can only read.<br />Refuses any write through the<br />VPC. Versioned.</div>")]
+        style 38 fill:#548235,stroke:#3a5b25,color:#ffffff
+        39[("<div style='font-weight: bold'>Results Bucket</div><div style='font-size: 70%; margin-top: 0px'>[Container: Amazon S3]</div><div style='font-size: 80%; margin-top:10px'>Findings out. Add-only under<br />results/, accepted only<br />through this VPC's S3<br />endpoint. Object Lock<br />enabled, its own KMS key.</div>")]
+        style 39 fill:#548235,stroke:#3a5b25,color:#ffffff
+        40("<div style='font-weight: bold'>FipResultsReader</div><div style='font-size: 70%; margin-top: 0px'>[Container: IAM Role]</div><div style='font-size: 80%; margin-top:10px'>Reads results from outside<br />the VPC. Denied every write,<br />delete and retention change.</div>")
+        style 40 fill:#bf8f00,stroke:#856400,color:#ffffff
       end
 
       subgraph group2 ["Evidence Account"]
@@ -192,7 +198,7 @@ graph LR
     1-. "<div>bin/fip-release.sh - a<br />deliberate chain-of-custody<br />decision, never automatic</div><div style='font-size: 70%'></div>" .->11
     11-. "<div>Writes a SIGNED custody<br />record. A revoke never erases<br />a release.</div><div style='font-size: 70%'></div>" .->23
     11-. "<div>Appends a custody entry</div><div style='font-size: 70%'></div>" .->24
-    11-. "<div>Grants Decrypt to the<br />analysis account, or retires<br />the grant</div><div style='font-size: 70%'></div>" .->25
+    11-. "<div>Grants Decrypt and<br />ReEncryptFrom to the analysis<br />account, or retires the grant</div><div style='font-size: 70%'></div>" .->25
     11-. "<div>Shares the evidence snapshots<br />so volumes can be created<br />from them</div><div style='font-size: 70%'></div>" .->31
     2-. "<div>Assumes. Examiner access is<br />an IAM permission, not a host<br />to log into.</div><div style='font-size: 70%'></div>" .->34
     34-. "<div>ssm:StartSession, pinned to<br />this document AND one<br />instance</div><div style='font-size: 70%'></div>" .->32
@@ -200,6 +206,11 @@ graph LR
     31-. "<div>Dials OUT over HTTPS. Nothing<br />dials in.</div><div style='font-size: 70%'></div>" .->30
     31-. "<div>Runs in a private isolated<br />subnet</div><div style='font-size: 70%'></div>" .->29
     31-. "<div>Appends the transcript.<br />Cannot delete or decrypt it.</div><div style='font-size: 70%'></div>" .->33
+    2-. "<div>Uploads tools from outside<br />the VPC</div><div style='font-size: 70%'></div>" .->38
+    31-. "<div>Reads tools through the S3<br />endpoint</div><div style='font-size: 70%'></div>" .->38
+    31-. "<div>Adds findings through the S3<br />endpoint. No read-back, no<br />delete.</div><div style='font-size: 70%'></div>" .->39
+    2-. "<div>Assumes to read findings</div><div style='font-size: 70%'></div>" .->40
+    40-. "<div>Reads and lists</div><div style='font-size: 70%'></div>" .->39
 
   end
 ```
@@ -302,7 +313,7 @@ graph LR
     1-. "<div>bin/fip-release.sh - a<br />deliberate chain-of-custody<br />decision, never automatic</div><div style='font-size: 70%'></div>" .->20
     20-. "<div>Writes a SIGNED custody<br />record. A revoke never erases<br />a release.</div><div style='font-size: 70%'></div>" .->23
     20-. "<div>Appends a custody entry</div><div style='font-size: 70%'></div>" .->24
-    20-. "<div>Grants Decrypt to the<br />analysis account, or retires<br />the grant</div><div style='font-size: 70%'></div>" .->25
+    20-. "<div>Grants Decrypt and<br />ReEncryptFrom to the analysis<br />account, or retires the grant</div><div style='font-size: 70%'></div>" .->25
     20-. "<div>Shares the evidence snapshots<br />so volumes can be created<br />from them</div><div style='font-size: 70%'></div>" .->31
     20-. "<div>evidence</div><div style='font-size: 70%'></div>" .->12
     10-. "<div>action=tag</div><div style='font-size: 70%'></div>" .->13

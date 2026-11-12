@@ -1216,7 +1216,8 @@ There is **no bastion, no key pair and no ingress rule anywhere** in this stack:
 | | |
 |---|---|
 | Network | One VPC, **private isolated subnets only**. No internet gateway, no NAT, **no route off the VPC at all** |
-| Access | AWS Systems Manager Session Manager, over interface endpoints for SSM, its two message channels and CloudWatch Logs. Outbound-initiated, so nothing listens |
+| Access | AWS Systems Manager Session Manager, over interface endpoints for SSM, its two message channels, CloudWatch Logs and KMS. Outbound-initiated, so nothing listens |
+| S3 | A gateway endpoint for tools in and results out, limited to this account's buckets and reads of the AWS package and agent buckets |
 | Credential | An IAM role. There is no key to hold, lose or rotate |
 | Audit | Keystroke-level transcript to S3 **and** CloudWatch, KMS-encrypted, in a bucket the examiner cannot delete from |
 
@@ -1232,11 +1233,19 @@ Replace the example number below with your analysis account id. This needs a
 add it with `fip configure --analysis` (§6.1). If a third party holds it, they run this step
 with their own credentials.
 
+From the `cdk` directory of your checkout:
+
 ```sh
+source ~/.fip/install.env                  # or export the account ids yourself
 export FIP_ANALYSIS_ACCOUNT_ID=333333333333
 npx cdk bootstrap aws://$FIP_ANALYSIS_ACCOUNT_ID/$AWS_REGION --profile fip-analysis
 npx cdk deploy FipAnalysisStack --profile fip-analysis
 ```
+
+`fip deploy` does not deploy this stack. It needs `FIP_EVIDENCE_ACCOUNT_ID` as well,
+because the examiner's access to released evidence names the evidence account. A third
+party who deploys it exports both ids and `AWS_REGION` instead of sourcing your
+configuration.
 
 The stack is only created when `FIP_ANALYSIS_ACCOUNT_ID` is set, and it is
 **account-agnostic** — a third-party examiner can deploy it in their own tenant without
@@ -1332,7 +1341,7 @@ The workstation can only read the tools bucket, and the bucket refuses any write
 arrives through the VPC, whoever's credentials are used, so it cannot become a second way
 out. It is versioned and the examiner cannot delete from it, so what was brought in, and
 when, stays on record. Anything that needs the internet at run time (online updates,
-licence checks, cloud lookups) will not work here, by design.
+license checks, cloud lookups) will not work here, by design.
 
 The S3 endpoint itself is limited: it reaches this account's buckets, and only reads the
 AWS-owned buckets that the package manager and the SSM agent need. Without that limit,
@@ -1481,11 +1490,13 @@ does less.
 - **No memory capture.** Volatile state is lost. Designed but not built.
 - **No detonation.** No sandbox, no sinkhole, no traffic analysis.
 - **No automatic triggering.** Cases start when a human starts one; no GuardDuty rule.
-- **No enumeration.** You supply the instance ids.
+- **No detection.** `fip instances` lists what is there; deciding which instances are
+  compromised is yours.
 - **Single region per deployment.**
 - **No forensic tooling of its own.** §10 gives you an isolated workstation with
-  `sleuthkit` and nothing else. Commercial tooling, a SIFT image or your own AMI is yours
-  to install, and FIP has no opinion about which.
+  `sleuthkit` and nothing else. Examiners bring their own tools in (§10, "Bring tools
+  in"), and FIP has no opinion about which. Tools that need the internet at run time
+  will not work there.
 - **No automated evidence delivery.** Releasing evidence to the analysis account is a
   deliberate, human-initiated step (§10), not something a case does on its own.
 - **No recovery of released copies.** Revoking access does not reach a volume the analysis

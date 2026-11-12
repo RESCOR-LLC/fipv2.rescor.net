@@ -12,6 +12,11 @@ with a signed chain-of-custody manifest.
   account, with a signed manifest in an Object Lock bucket.
 - **Release and restore**: hand evidence to an examiner's account, and put an
   instance back on its original security groups, each as a signed custody record.
+- **Examine, optionally**: an isolated workstation in an analysis account, which may be
+  a third party's. No route off its VPC, reached only by logged Session Manager
+  sessions, with buckets for bringing tools in and getting findings out.
+- **Keep an incident together**: an incident case gathers every run, ticket, comment,
+  release and restore of one incident in a signed, chained log.
 
 FIP never terminates an instance and never deletes a snapshot.
 
