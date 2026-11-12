@@ -10,7 +10,7 @@ The stacks and the `fip` command. To install and use FIP, follow
 | `FipCoreStack` | Evidence | Evidence CMK, Object Lock evidence bucket, case table, responder topic, `FipEvidenceRole` |
 | `FipOrchestratorStack` | Orchestrator | `FipCase` and `FipAcquisition` state machines, member-action Lambda, manifest signing key |
 | `FipMemberStack` | Each member account | `FipInventoryRole` (read-only) and, optionally, `FipResponderRole` |
-| `FipAnalysisStack` | Analysis, optional | Isolated examiner workstation reached by Session Manager |
+| `FipAnalysisStack` | Analysis, optional | Isolated VPC and examiner workstation reached by Session Manager, session transcripts, tools and results buckets, `FipExaminerRole` and `FipResultsReader` |
 
 `bin/` holds `fip` and its subcommands; `lambda/member-action/` holds the one Lambda;
 `synth/` holds the committed member template (see its README).
@@ -24,7 +24,8 @@ npm run nag         # cdk-nag; must be clean
 ```
 
 Synth and deploy need account ids; `fip configure` saves them and `fip deploy` passes
-them (manual §3).
+them (manual §3). `fip deploy` covers the core, orchestrator and member stacks; the
+analysis stack is deployed on its own, in the analysis account (manual §10).
 
 ## Two things to know before editing
 
