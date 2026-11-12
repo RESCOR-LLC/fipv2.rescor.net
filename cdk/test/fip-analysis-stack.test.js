@@ -562,3 +562,61 @@ describe('results leave over the S3 endpoint, append-only', () => {
     assert.ok(JSON.stringify(reader[1].Properties.AssumeRolePolicyDocument).includes(arn));
   });
 });
+
+describe('tools come in, and the S3 endpoint is not a way out', () => {
+  function statementsOf(t, rolePattern) {
+    const out = [];
+    for (const [name, res] of Object.entries(t.findResources('AWS::IAM::Policy'))) {
+      if (rolePattern.test(name)) out.push(...res.Properties.PolicyDocument.Statement);
+    }
+    return out;
+  }
+  const actionsOn = (sts, re) => sts
+    .filter((st) => st.Effect !== 'Deny' && re.test(JSON.stringify(st.Resource ?? '')))
+    .flatMap((st) => [].concat(st.Action));
+
+  test('the S3 endpoint reaches this account\'s buckets, and only reads AWS-owned ones', () => {
+    // With no policy a gateway endpoint reaches every bucket in S3, which is
+    // a way out for anyone on the workstation holding outside credentials.
+    const t = synth();
+    const ep = Object.values(t.findResources('AWS::EC2::VPCEndpoint'))
+      .find((r) => r.Properties.VpcEndpointType === 'Gateway');
+    const sts = ep?.Properties?.PolicyDocument?.Statement;
+    assert.ok(sts?.length, 'the S3 endpoint must have a policy');
+    for (const st of sts) {
+      assert.strictEqual(st.Effect, 'Allow');
+      const actions = [].concat(st.Action);
+      if (actions.includes('s3:*')) {
+        assert.ok(st.Condition?.StringEquals?.['aws:ResourceAccount'],
+          'full access must be confined to this account\'s buckets');
+      } else {
+        assert.deepStrictEqual(actions, ['s3:GetObject'], 'other buckets are read-only');
+      }
+    }
+    assert.match(JSON.stringify(sts), /al2023-repos-/, 'dnf must reach the Amazon Linux repositories');
+  });
+
+  test('the examiner can upload tools; the workstation can only read them', () => {
+    const t = synth();
+    const tools = /FipTools/;
+    const examiner = actionsOn(statementsOf(t, /Examiner/), tools);
+    const ws = actionsOn(statementsOf(t, /Workstation/), tools);
+    assert.ok(examiner.includes('s3:PutObject'));
+    assert.ok(!examiner.some((a) => /Delete/.test(a)), 'what was brought in stays on record');
+    assert.ok(ws.includes('s3:GetObject'));
+    assert.ok(!ws.some((a) => /Put|Delete/.test(a)), 'the workstation must not write to the tools bucket');
+  });
+
+  test('the tools bucket refuses every write that comes from the analysis VPC', () => {
+    // Otherwise someone else's credentials, used on the workstation, would
+    // make the tools bucket a second way out.
+    const t = synth();
+    const [name] = Object.entries(t.findResources('AWS::S3::Bucket')).find(([n]) => /^FipTools/.test(n));
+    const policy = Object.values(t.findResources('AWS::S3::BucketPolicy'))
+      .find((p) => JSON.stringify(p.Properties.Bucket).includes(name));
+    const deny = policy.Properties.PolicyDocument.Statement.find(
+      (st) => st.Effect === 'Deny' && [].concat(st.Action).includes('s3:PutObject'));
+    assert.ok(deny);
+    assert.match(JSON.stringify(deny.Condition?.StringEquals ?? {}), /aws:SourceVpce.*S3Endpoint/);
+  });
+});

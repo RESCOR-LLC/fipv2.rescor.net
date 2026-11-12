@@ -456,6 +456,8 @@ if (app.node.tryGetContext('fip:nag') === 'true') {
           'Action::kms:GenerateDataKey*',
           { regex: String.raw`/^Resource::<FipSessionLogGroup.*\.Arn>.*$/g` },
           { regex: String.raw`/^Resource::arn:<AWS::Partition>:logs:.*:log-group:\*$/g` },
+          // Tools: read-only on the tools/ prefix of the tools bucket.
+          { regex: String.raw`/^Resource::<FipTools[0-9A-F]+\.Arn>\/tools\/\*$/g` },
         ],
       }],
     );
@@ -482,6 +484,8 @@ if (app.node.tryGetContext('fip:nag') === 'true') {
           'Resource::*',
           { regex: String.raw`/^Resource::arn:<AWS::Partition>:ssm:.*:session/.*\*$/g` },
           { regex: String.raw`/^Resource::arn:<AWS::Partition>:kms:.*:key/\*$/g` },
+          // Tools: put and get on the tools/ prefix of the tools bucket, no delete.
+          { regex: String.raw`/^Resource::<FipTools[0-9A-F]+\.Arn>\/tools\/\*$/g` },
         ],
       }],
     );
