@@ -1507,10 +1507,13 @@ async function applyRelease({ ec2, kms, copies, target, revoke, grantNames }) {
     KeyId: keyId, GranteePrincipal: principal,
     // Named so a revoke finds exactly the grants this case created.
     Name: grantNames[0],
-    // Read paths only: no Encrypt, ReEncrypt or CreateGrant. An examiner
+    // Read paths only: no Encrypt, ReEncryptTo or CreateGrant. An examiner
     // reads evidence; they cannot make new ciphertext under the forensic key
-    // or widen their own access.
-    Operations: ['Decrypt', 'DescribeKey'],
+    // or widen their own access. ReEncryptFrom is required: EBS re-encrypts a
+    // volume made from a cross-account snapshot into the analysis account's
+    // own key, and without it the volume is created and silently deleted.
+    // It moves ciphertext out of the forensic key, never into it.
+    Operations: ['Decrypt', 'DescribeKey', 'ReEncryptFrom'],
   }));
   const shared = [];
   const rollback = async (cause) => {

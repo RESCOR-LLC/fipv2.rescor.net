@@ -116,15 +116,17 @@ describe('no bastion — a jump-host tier must not grow here', () => {
 });
 
 describe('Session Manager has what it needs', () => {
-  test('all three required interface endpoints exist', () => {
+  test('all four required interface endpoints exist', () => {
     const endpoints = synth().findResources('AWS::EC2::VPCEndpoint');
     const names = Object.values(endpoints)
       .map((r) => JSON.stringify(r.Properties.ServiceName))
       .join(' ');
-    for (const required of ['ssm', 'ssmmessages', 'ec2messages']) {
+    // logs: the document streams to an encrypted log group, and the agent
+    // refuses the session if it cannot reach Logs to confirm the encryption.
+    for (const required of ['ssm', 'ssmmessages', 'ec2messages', 'logs']) {
       assert.match(
         names, new RegExp(`\\.${required}"`),
-        `the ${required} endpoint is missing. Omit any one of the three and ` +
+        `the ${required} endpoint is missing. Omit any one of them and ` +
         `sessions fail with an error that does not say which, so they are ` +
         `created and asserted together.`,
       );
@@ -228,6 +230,42 @@ describe('the session is recorded, and the examiner cannot stop it', () => {
       'kms:Decrypt on the session key is not needed to WRITE a transcript, and ' +
       'granting it would let the examiner read back other examiners\' sessions.',
     );
+  });
+
+  test('the session log group is KMS-encrypted, as the document requires', () => {
+    // cloudWatchEncryptionEnabled with an unencrypted group: no session starts.
+    const t = synth();
+    const groups = Object.values(t.findResources('AWS::Logs::LogGroup'))
+      .filter((g) => g.Properties.LogGroupName === '/fip/analysis/sessions');
+    assert.strictEqual(groups.length, 1);
+    assert.match(JSON.stringify(groups[0].Properties.KmsKeyId ?? ''), /FipSessionLogKey/);
+    // And the agent must be able to see that it is: it checks with
+    // DescribeLogGroups, and treats a denial as "not encrypted".
+    const ws = Object.entries(t.findResources('AWS::IAM::Policy'))
+      .filter(([name]) => /Workstation/i.test(name))
+      .flatMap(([, res]) => res.Properties.PolicyDocument.Statement)
+      .filter((st) => st.Effect !== 'Deny')
+      .flatMap((st) => [].concat(st.Action));
+    assert.ok(ws.includes('logs:DescribeLogGroups'));
+  });
+
+  test('the session channel has its own key: examiner encrypts, workstation decrypts', () => {
+    // Session Manager channel encryption needs GenerateDataKey for the client
+    // and Decrypt for the instance. On the transcript key that Decrypt would
+    // expose every transcript, so the document must name a different key.
+    const t = synth();
+    const docs = Object.values(t.findResources('AWS::SSM::Document'));
+    const keyRef = JSON.stringify(docs[0].Properties.Content.inputs.kmsKeyId);
+    assert.match(keyRef, /FipSessionChannelKey/, 'the document must use the channel key');
+    assert.doesNotMatch(keyRef, /FipSessionLogKey/);
+    const policies = t.findResources('AWS::IAM::Policy');
+    const on = (role) => Object.entries(policies)
+      .filter(([name]) => new RegExp(role, 'i').test(name))
+      .flatMap(([, res]) => res.Properties.PolicyDocument.Statement)
+      .filter((st) => st.Effect !== 'Deny' && /FipSessionChannelKey/.test(JSON.stringify(st.Resource ?? '')))
+      .flatMap((st) => [].concat(st.Action));
+    assert.ok(on('Examiner').includes('kms:GenerateDataKey'), 'examiner must be able to start a session');
+    assert.ok(on('Workstation').includes('kms:Decrypt'), 'workstation must be able to join the session');
   });
 
   test('the workstation has termination protection', () => {
@@ -373,6 +411,30 @@ describe('the examiner can use released evidence, and only use it', () => {
     }
   });
 
+  test('can re-encrypt released evidence out of the forensic key, only through EBS', () => {
+    // Without this a volume made from a released snapshot is created and then
+    // silently deleted: EBS calls ReEncryptFrom on the forensic key as the
+    // examiner, and a cross-account key needs it allowed on this side too.
+    const policies = synth().findResources('AWS::IAM::Policy');
+    const onEvidenceKey = [];
+    for (const [name, res] of Object.entries(policies)) {
+      if (!/Examiner/i.test(name)) continue;
+      for (const st of res.Properties.PolicyDocument.Statement) {
+        if (st.Effect === 'Deny') continue;
+        if (JSON.stringify(st.Resource ?? '').includes(`:${EVIDENCE}:key/`)) onEvidenceKey.push(st);
+      }
+    }
+    assert.strictEqual(onEvidenceKey.length, 1, 'one statement on the evidence account keys');
+    const [st] = onEvidenceKey;
+    const actions = [].concat(st.Action);
+    assert.ok(actions.includes('kms:ReEncryptFrom'));
+    for (const forbidden of ['kms:ReEncryptTo', 'kms:ReEncrypt*', 'kms:Encrypt', 'kms:CreateGrant', 'kms:*']) {
+      assert.ok(!actions.includes(forbidden), `${forbidden} on the forensic key would let the examiner write under it`);
+    }
+    assert.match(JSON.stringify(st.Condition?.StringEquals?.['kms:ViaService'] ?? ''), /ec2\./,
+      'KMS on evidence must be reachable only through EC2');
+  });
+
   test('cannot destroy evidence', () => {
     const actions = examinerActions();
     for (const forbidden of ['ec2:DeleteSnapshot', 'ec2:DeleteVolume']) {
@@ -467,8 +529,13 @@ describe('results leave over the S3 endpoint, append-only', () => {
     const decrypt = statementsOf(synth(), /Workstation/).filter(
       (st) => st.Effect !== 'Deny' && [].concat(st.Action).includes('kms:Decrypt'));
     for (const st of decrypt) {
-      assert.match(JSON.stringify(st.Resource), /FipResultsKey/,
-        'the only Decrypt the workstation holds is on the results key');
+      const on = JSON.stringify(st.Resource);
+      assert.doesNotMatch(on, /FipSessionLogKey/, 'Decrypt on the transcript key exposes every session');
+      // The channel key encrypts nothing at rest; the instance must decrypt
+      // the channel to join a session (asserted with the session tests).
+      if (/FipSessionChannelKey/.test(on)) continue;
+      assert.match(on, /FipResultsKey/,
+        'apart from the session channel, the only Decrypt the workstation holds is on the results key');
       assert.ok(st.Condition?.StringEquals?.['kms:ViaService'],
         'Decrypt must be confined to S3 assembling a multipart upload');
     }

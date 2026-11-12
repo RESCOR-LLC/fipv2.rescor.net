@@ -446,12 +446,16 @@ if (app.node.tryGetContext('fip:nag') === 'true') {
           'are in. The kms wildcards are CDK\'s own grant expansion against a single ' +
           'named key, and this role can Encrypt but not Decrypt, so it cannot read ' +
           'back another session. Results are the same shape: s3:PutObject only, on ' +
-          'the results/ prefix of the results bucket, with no read-back and no delete.',
+          'the results/ prefix of the results bucket, with no read-back and no delete. ' +
+          'Its kms:Decrypt is on the session CHANNEL key, which encrypts nothing at rest. ' +
+          'logs:DescribeLogGroups is a list call that only takes log-group:*; the agent ' +
+          'needs it to confirm the session log group is encrypted, and it reads metadata only.',
         appliesTo: [
           'Resource::<FipSessionLogs1E41B5D5.Arn>/sessions/*',
           { regex: String.raw`/^Resource::<FipResults[0-9A-F]+\.Arn>\/results\/\*$/g` },
           'Action::kms:GenerateDataKey*',
           { regex: String.raw`/^Resource::<FipSessionLogGroup.*\.Arn>.*$/g` },
+          { regex: String.raw`/^Resource::arn:<AWS::Partition>:logs:.*:log-group:\*$/g` },
         ],
       }],
     );
@@ -470,10 +474,14 @@ if (app.node.tryGetContext('fip:nag') === 'true') {
           'permissions; all are read-only. What matters is that ssm:StartSession IS ' +
           'pinned, to one instance AND the logged session document, and that this role ' +
           'carries an explicit Deny on every route to altering the audit trail. ' +
-          'test/fip-analysis-stack.test.js asserts both.',
+          'test/fip-analysis-stack.test.js asserts both. The evidence account key/* ' +
+          'wildcard: release grants name the key at run time, so it is unknown here; ' +
+          'the statement is Decrypt/DescribeKey/ReEncryptFrom only, through EC2 only, ' +
+          'and the evidence side still needs a grant per case.',
         appliesTo: [
           'Resource::*',
           { regex: String.raw`/^Resource::arn:<AWS::Partition>:ssm:.*:session/.*\*$/g` },
+          { regex: String.raw`/^Resource::arn:<AWS::Partition>:kms:.*:key/\*$/g` },
         ],
       }],
     );
