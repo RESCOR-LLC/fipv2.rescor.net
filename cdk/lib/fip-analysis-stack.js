@@ -641,6 +641,94 @@ class FipAnalysisStack extends Stack {
       resources: ['*'],
     }));
 
+    // ── Tools in ──────────────────────────────────────────────────────
+    // An examiner, often a third party, brings their own tools. The VPC has
+    // no route out, so tools come in the way results go out: over the S3
+    // endpoint. Two sources:
+    //
+    //   1. The Amazon Linux package repositories, which AWS serves from S3:
+    //      `sudo dnf install <package>` works on the workstation as is.
+    //   2. This bucket, for anything else (RPMs, wheels, static binaries).
+    //      The examiner uploads from OUTSIDE the VPC; the workstation can
+    //      only read it.
+    //
+    // Writes from inside the VPC are refused, even with someone else's
+    // credentials, so the tools bucket can never become a second way out.
+    // Versioned, with no delete for the examiner: what was brought in, and
+    // when, stays on record.
+    const toolsBucket = new s3.Bucket(this, 'FipTools', {
+      bucketName: `fip-analysis-tools-${this.account}-${this.region}`,
+      serverAccessLogsBucket: sessionAccessLogs,
+      serverAccessLogsPrefix: 'tools-bucket-access/',
+      versioned: true,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      enforceSSL: true,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
+    toolsBucket.addToResourcePolicy(new iam.PolicyStatement({
+      sid: 'NoWritesFromTheAnalysisVpc',
+      effect: iam.Effect.DENY,
+      principals: [new iam.AnyPrincipal()],
+      actions: ['s3:PutObject', 's3:DeleteObject', 's3:DeleteObjectVersion'],
+      resources: [toolsBucket.arnForObjects('*')],
+      conditions: { StringEquals: { 'aws:SourceVpce': s3Endpoint.vpcEndpointId } },
+    }));
+    examinerRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'BringToolsIn',
+      actions: ['s3:PutObject', 's3:GetObject'],
+      resources: [toolsBucket.arnForObjects('tools/*')],
+    }));
+    examinerRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'ListTools',
+      actions: ['s3:ListBucket'],
+      resources: [toolsBucket.bucketArn],
+    }));
+    workstationRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'ReadToolsOnly',
+      actions: ['s3:GetObject'],
+      resources: [toolsBucket.arnForObjects('tools/*')],
+    }));
+    workstationRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'ListToolsOnly',
+      actions: ['s3:ListBucket'],
+      resources: [toolsBucket.bucketArn],
+    }));
+
+    // ── What the S3 endpoint reaches ──────────────────────────────────
+    // Without a policy a gateway endpoint reaches EVERY bucket in S3, so
+    // anyone on the workstation holding credentials from elsewhere could
+    // copy data to a bucket of their own. "No route off the VPC" would be
+    // untrue. The endpoint reaches this account's buckets, and reads (only)
+    // the AWS-owned buckets the operating system and the SSM agent need.
+    s3Endpoint.addToPolicy(new iam.PolicyStatement({
+      sid: 'ThisAccountsBucketsOnly',
+      principals: [new iam.AnyPrincipal()],
+      actions: ['s3:*'],
+      resources: ['*'],
+      conditions: { StringEquals: { 'aws:ResourceAccount': this.account } },
+    }));
+    s3Endpoint.addToPolicy(new iam.PolicyStatement({
+      sid: 'ReadAwsOwnedPackageAndAgentBuckets',
+      principals: [new iam.AnyPrincipal()],
+      actions: ['s3:GetObject'],
+      resources: [
+        // Amazon Linux 2023 package repositories (dnf).
+        `arn:${this.partition}:s3:::al2023-repos-${this.region}-de612dc2/*`,
+        // SSM agent updates and documents (AWS's documented list).
+        `arn:${this.partition}:s3:::amazon-ssm-${this.region}/*`,
+        `arn:${this.partition}:s3:::amazon-ssm-packages-${this.region}/*`,
+        `arn:${this.partition}:s3:::aws-ssm-${this.region}/*`,
+        `arn:${this.partition}:s3:::${this.region}-birdwatcher-prod/*`,
+        `arn:${this.partition}:s3:::aws-ssm-document-attachments-${this.region}/*`,
+        `arn:${this.partition}:s3:::patch-baseline-snapshot-${this.region}/*`,
+      ],
+    }));
+
+    new CfnOutput(this, 'ToolsBucket', {
+      value: toolsBucket.bucketName,
+      description: 'Examiner uploads from outside: aws s3 cp <tool> s3://<this>/tools/. Workstation reads only.',
+    });
     new CfnOutput(this, 'ResultsBucket', {
       value: resultsBucket.bucketName,
       description: 'Write from the workstation: aws s3 cp <file> s3://<this>/results/<case>/ --checksum-algorithm SHA256',
@@ -665,6 +753,7 @@ class FipAnalysisStack extends Stack {
     this.examinerRole = examinerRole;
     this.sessionLogBucket = sessionLogBucket;
     this.resultsBucket = resultsBucket;
+    this.toolsBucket = toolsBucket;
     this.orgId = orgId;
   }
 }

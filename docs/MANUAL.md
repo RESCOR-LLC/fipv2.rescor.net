@@ -79,7 +79,9 @@ commands, for when `fip` is unavailable. Teardown lives in
   - [Connect](#connect)
   - [Release the evidence to the analysis account](#release-the-evidence-to-the-analysis-account)
   - [Mount evidence read-only](#mount-evidence-read-only)
-  - [Cost, and turning it off](#cost-and-turning-it-off)
+  - [Bring tools in](#bring-tools-in)
+  - [Get results out](#get-results-out)
+  - [Keep it or remove it](#keep-it-or-remove-it)
 - [11. Tags, and finding what FIP made](#11-tags-and-finding-what-fip-made)
 - [12. Troubleshooting](#12-troubleshooting)
 - [13. What FIP does not do](#13-what-fip-does-not-do)
@@ -1308,6 +1310,35 @@ and launches it in the isolated subnets with a security group that has no rules 
 the instance metadata service disabled. Tag the copies `fip:class=test` and remove
 them when done; they are not evidence.
 
+### Bring tools in
+
+Examiners, third parties especially, bring their own tools. The VPC has no route out, so
+tools come in over the S3 endpoint, the same way results go out:
+
+| Source | How |
+|---|---|
+| Amazon Linux packages | `sudo dnf install <package>` on the workstation. AWS serves the repositories from S3, and the endpoint can read them |
+| Anything else (RPMs, Python wheels, static binaries, rule sets) | Upload from **outside** the VPC, as the examiner role, to the **tools bucket** (stack output `ToolsBucket`), then fetch it on the workstation |
+
+```sh
+# On the examiner's own machine, as FipExaminer:
+aws s3 cp sleuthkit.rpm s3://<tools bucket>/tools/
+# On the workstation:
+aws s3 cp s3://<tools bucket>/tools/sleuthkit.rpm /tmp/ && sudo dnf install -y /tmp/sleuthkit.rpm
+pip install --no-index --find-links /tmp/wheels <package>   # wheels the same way
+```
+
+The workstation can only read the tools bucket, and the bucket refuses any write that
+arrives through the VPC, whoever's credentials are used, so it cannot become a second way
+out. It is versioned and the examiner cannot delete from it, so what was brought in, and
+when, stays on record. Anything that needs the internet at run time (online updates,
+licence checks, cloud lookups) will not work here, by design.
+
+The S3 endpoint itself is limited: it reaches this account's buckets, and only reads the
+AWS-owned buckets that the package manager and the SSM agent need. Without that limit,
+anyone on the workstation with credentials from elsewhere could copy data to a bucket
+of their own.
+
 ### Get results out
 
 The VPC has no route out, so findings leave the way the session transcripts do: over the
@@ -1335,12 +1366,31 @@ Until you do, the role trusts only the analysis account itself. Results do **not
 through a snapshot: the examiner cannot create one, because a snapshot made here would sit
 beside the evidence with no manifest and no provenance.
 
-### Cost, and turning it off
+### Keep it or remove it
 
-Five interface endpoints (the four above plus KMS) and the workstation bill hourly whether or not anyone is
-working. **Stop the workstation between engagements** — Session Manager reconnects when
-it starts again, with no key or address to re-establish. The instance has termination
-protection on, so stopping is the intended idle state rather than terminating.
+Five interface endpoints (SSM, its two message channels, CloudWatch Logs and KMS) and
+the workstation bill hourly whether or not anyone is working. Whether to keep the stack
+between engagements is your decision:
+
+- **Keep it, stopped.** Stop the workstation; Session Manager reconnects when it starts
+  again, with no key or address to re-establish. The endpoints still bill.
+- **Remove it.** Nothing else in FIP depends on it, and it can be deployed again when the
+  next case needs it.
+
+To remove it, first withdraw any release (`fip release --case <id> --to <account> --revoke`),
+then, in the analysis account:
+
+```sh
+aws ec2 modify-instance-attribute --instance-id <workstation id> --no-disable-api-termination
+npx cdk destroy FipAnalysisStack --profile fip-analysis
+```
+
+The destroy deliberately **keeps** what may be part of the record: the session
+transcript, results, tools and access-log buckets, the session and flow-log log groups,
+and the three KMS keys. Keep them as long as the case requires. They have fixed names,
+so the stack cannot be deployed again in the same account and region until they are
+gone. Once the record no longer needs them, empty and delete the buckets (every version)
+and the log groups, and schedule the keys for deletion.
 
 ---
 ## 11. Tags, and finding what FIP made
