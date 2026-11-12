@@ -800,7 +800,11 @@ without its record. The snapshot ids come from the table, not the command line. 
 account may be outside your organization.
 
 The analysis account may create volumes from the snapshots and decrypt them; not delete
-them, re-encrypt them under your key, or widen its own access. Each release writes a
+them, re-encrypt anything under your key, or widen its own access. The grant includes
+`ReEncryptFrom` because EBS re-encrypts a volume made from another account's snapshot
+into the analysis account's own key; that moves data out of your key, never into it.
+A release made before this grant included it lets the analysis account see the
+snapshots but not build volumes from them: revoke and release again. Each release writes a
 signed custody record, `cases/<id>/custody/<time>-release.json`, and an entry on the
 row.
 
@@ -1210,7 +1214,7 @@ There is **no bastion, no key pair and no ingress rule anywhere** in this stack:
 | | |
 |---|---|
 | Network | One VPC, **private isolated subnets only**. No internet gateway, no NAT, **no route off the VPC at all** |
-| Access | AWS Systems Manager Session Manager, over three interface endpoints. Outbound-initiated, so nothing listens |
+| Access | AWS Systems Manager Session Manager, over interface endpoints for SSM, its two message channels and CloudWatch Logs. Outbound-initiated, so nothing listens |
 | Credential | An IAM role. There is no key to hold, lose or rotate |
 | Audit | Keystroke-level transcript to S3 **and** CloudWatch, KMS-encrypted, in a bucket the examiner cannot delete from |
 
@@ -1270,15 +1274,39 @@ the orchestrator, and `fip release --revoke` to withdraw it.
 
 ### Mount evidence read-only
 
-On the workstation, create a volume from a released snapshot, attach it, and mount it
-read-only:
+As the examiner role, create a volume from a released snapshot in the workstation's
+Availability Zone and attach it. EBS re-encrypts the volume into the analysis account's
+own key; the evidence snapshot is not changed.
 
 ```sh
-mount -o ro,noexec,nodev,noload /dev/nvme1n1p1 /mnt/evidence
+aws ec2 create-volume --snapshot-id <snapshot id> --availability-zone <workstation AZ>
+aws ec2 attach-volume --volume-id <volume id> --instance-id <workstation id> --device /dev/sdf
 ```
 
-`noload` matters on ext3/ext4: without it the kernel replays the journal, **writing to
-the volume you are treating as evidence**. `ro` alone does not prevent that.
+Then, in a session on the workstation, check the filesystem type, set the device
+read-only, and mount it with the options for that type:
+
+```sh
+lsblk -f
+sudo blockdev --setro /dev/nvme1n1 /dev/nvme1n1p1
+# xfs (Amazon Linux, RHEL and their relatives):
+sudo mount -o ro,norecovery,nouuid,noexec,nodev /dev/nvme1n1p1 /mnt/evidence
+# ext3/ext4:
+sudo mount -o ro,noload,noexec,nodev /dev/nvme1n1p1 /mnt/evidence
+```
+
+`norecovery` (xfs) and `noload` (ext3/ext4) matter: without them the kernel replays the
+journal, **writing to the volume you are treating as evidence**. `ro` alone does not
+prevent that. Each is rejected by the other filesystem, so check the type first.
+`nouuid` lets xfs mount a disk cloned from the same image as the workstation, which
+otherwise has a duplicate UUID. `blockdev --setro` refuses writes at the device as well.
+
+Booting evidence is not part of the examiner role: it needs a snapshot made in the
+analysis account, which would have no manifest or provenance. If a case needs it, an
+administrator of the analysis account builds a working copy (volume, snapshot, image)
+and launches it in the isolated subnets with a security group that has no rules and
+the instance metadata service disabled. Tag the copies `fip:class=test` and remove
+them when done; they are not evidence.
 
 ### Get results out
 
@@ -1309,7 +1337,7 @@ beside the evidence with no manifest and no provenance.
 
 ### Cost, and turning it off
 
-Four interface endpoints and the workstation bill hourly whether or not anyone is
+Five interface endpoints (the four above plus KMS) and the workstation bill hourly whether or not anyone is
 working. **Stop the workstation between engagements** — Session Manager reconnects when
 it starts again, with no key or address to re-establish. The instance has termination
 protection on, so stopping is the intended idle state rather than terminating.

@@ -140,6 +140,10 @@ class FipAnalysisStack extends Stack {
       ['Ssm', ec2.InterfaceVpcEndpointAwsService.SSM],
       ['SsmMessages', ec2.InterfaceVpcEndpointAwsService.SSM_MESSAGES],
       ['Ec2Messages', ec2.InterfaceVpcEndpointAwsService.EC2_MESSAGES],
+      // The session document streams to CloudWatch Logs and requires the
+      // group to be encrypted. With no route to Logs the agent cannot check
+      // that, and refuses every session as "encryption is not set up".
+      ['Logs', ec2.InterfaceVpcEndpointAwsService.CLOUDWATCH_LOGS],
     ]) {
       vpc.addInterfaceEndpoint(`${name}Endpoint`, {
         service,
@@ -181,6 +185,19 @@ class FipAnalysisStack extends Stack {
       removalPolicy: RemovalPolicy.RETAIN,
     });
 
+    // A SEPARATE key for the session channel. Session Manager encrypts the
+    // channel under the document's kmsKeyId: the person starting the session
+    // needs kms:GenerateDataKey on it and the instance needs kms:Decrypt.
+    // Giving the workstation Decrypt on the transcript key would let an
+    // examiner read back every other session's transcript, so the channel
+    // gets its own key, which encrypts nothing at rest.
+    const channelKey = new kms.Key(this, 'FipSessionChannelKey', {
+      alias: 'alias/fip-analysis-session-channel',
+      description: 'Encrypts the Session Manager channel for FIP analysis sessions (nothing at rest)',
+      enableKeyRotation: true,
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
+
     // Access logs for the session log bucket. No Object Lock here: a locked
     // access-log bucket is a recursive dependency and a cost trap, and access
     // logs are not evidence. Same reasoning as the evidence bucket's.
@@ -208,8 +225,27 @@ class FipAnalysisStack extends Stack {
       removalPolicy: RemovalPolicy.RETAIN,
     });
 
+    // The session document sets cloudWatchEncryptionEnabled, and Session
+    // Manager refuses to start a session unless the log group really is
+    // KMS-encrypted. CloudWatch Logs uses the key itself, so the key policy
+    // must allow the service, confined to this one log group.
+    const sessionLogGroupName = '/fip/analysis/sessions';
+    sessionKey.addToResourcePolicy(new iam.PolicyStatement({
+      sid: 'CloudWatchLogsEncryptsSessionLogGroup',
+      principals: [new iam.ServicePrincipal(`logs.${this.region}.amazonaws.com`)],
+      actions: ['kms:Encrypt*', 'kms:Decrypt*', 'kms:ReEncrypt*', 'kms:GenerateDataKey*', 'kms:Describe*'],
+      resources: ['*'],
+      conditions: {
+        ArnEquals: {
+          'kms:EncryptionContext:aws:logs:arn':
+            `arn:${this.partition}:logs:${this.region}:${this.account}:log-group:${sessionLogGroupName}`,
+        },
+      },
+    }));
+
     const sessionLogGroup = new logs.LogGroup(this, 'FipSessionLogGroup', {
-      logGroupName: '/fip/analysis/sessions',
+      logGroupName: sessionLogGroupName,
+      encryptionKey: sessionKey,
       retention: logs.RetentionDays.ONE_YEAR,
       removalPolicy: RemovalPolicy.RETAIN,
     });
@@ -240,9 +276,10 @@ class FipAnalysisStack extends Stack {
           cloudWatchLogGroupName: sessionLogGroup.logGroupName,
           cloudWatchEncryptionEnabled: true,
           cloudWatchStreamingEnabled: true,
-          // Encrypts the session channel itself with the KMS key, so the
-          // transcript is protected in flight and not merely at rest.
-          kmsKeyId: sessionKey.keyId,
+          // Encrypts the session channel itself, so the transcript is
+          // protected in flight and not merely at rest. The channel key,
+          // not the transcript key: see FipSessionChannelKey.
+          kmsKeyId: channelKey.keyId,
           // No shell profile commands. Anything injected here would run
           // before the examiner's first keystroke and would not appear in
           // their transcript as something they did.
@@ -294,6 +331,16 @@ class FipAnalysisStack extends Stack {
       'kms:Encrypt', 'kms:GenerateDataKey', 'kms:DescribeKey',
     );
     sessionLogGroup.grantWrite(workstationRole);
+    // The instance's half of the channel encryption.
+    channelKey.grant(workstationRole, 'kms:Decrypt');
+    // The agent checks that the session log group is encrypted before it
+    // starts a session, with DescribeLogGroups. Denied, it reports the group
+    // as unencrypted and refuses the session. A list call: log-group:* only.
+    workstationRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'ConfirmSessionLogGroupEncryption',
+      actions: ['logs:DescribeLogGroups'],
+      resources: [`arn:${this.partition}:logs:${this.region}:${this.account}:log-group:*`],
+    }));
 
     const workstationSecurityGroup = new ec2.SecurityGroup(this, 'FipWorkstationSg', {
       vpc,
@@ -402,6 +449,9 @@ class FipAnalysisStack extends Stack {
         `arn:${this.partition}:ssm:${this.region}:${this.account}:document/${sessionDocument.name}`,
       ],
     }));
+    // The client's half of the channel encryption: without it the session
+    // fails at the handshake. On the channel key only, never the transcript key.
+    channelKey.grant(examinerRole, 'kms:GenerateDataKey');
 
     examinerRole.addToPolicy(new iam.PolicyStatement({
       sid: 'ManageOwnSessionsOnly',
@@ -448,6 +498,22 @@ class FipAnalysisStack extends Stack {
         // Region-pinned at least: a volume created in another region would be
         // outside the audit boundary this account establishes.
         StringEquals: { 'aws:RequestedRegion': this.region },
+      },
+    }));
+
+    // The KMS half of the same step. A volume made from a snapshot shared by
+    // another account cannot stay under that account's key: EBS re-encrypts
+    // it into this account's EBS key, calling ReEncryptFrom on the forensic
+    // key as the examiner. The release grant allows it on the evidence side;
+    // a cross-account key also needs it allowed here, on the caller's side.
+    // Only through EC2, so the examiner cannot call KMS on evidence directly.
+    // ReEncryptFrom moves ciphertext OUT of the forensic key, never into it.
+    examinerRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'ReadReleasedEvidenceKeyThroughEbs',
+      actions: ['kms:Decrypt', 'kms:DescribeKey', 'kms:ReEncryptFrom'],
+      resources: [`arn:${this.partition}:kms:${this.region}:${evidenceAccountId}:key/*`],
+      conditions: {
+        StringEquals: { 'kms:ViaService': `ec2.${this.region}.amazonaws.com` },
       },
     }));
 
