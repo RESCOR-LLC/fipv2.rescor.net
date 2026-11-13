@@ -93,6 +93,7 @@ ADMIN_ROLE="${FIP_ADMIN_ROLE:-AWSControlTowerExecution}"
 SOURCE_PROFILE="${FIP_SOURCE_PROFILE:-default}"
 ORCH_PROFILE="${FIP_ORCHESTRATOR_PROFILE:-fip-orchestrator}"
 EVID_PROFILE="${FIP_EVIDENCE_PROFILE:-fip-evidence}"
+ANALYSIS_PROFILE="${FIP_ANALYSIS_PROFILE:-fip-analysis}"
 RESPONDER="${FIP_DEPLOY_RESPONDER:-Yes}"
 ALLOW_RESTORE="${FIP_ALLOW_RESTORE:-Yes}"
 PRODUCTION="${FIP_PRODUCTION_MODE:-false}"
@@ -459,6 +460,24 @@ for m in "${NORMALIZED[@]}"; do
     ensure_profile "${m#*=}" "$id"; RESOLVED+=("$id=$CHOSEN")
 done
 NORMALIZED=("${RESOLVED[@]}")
+# The analysis account gets a profile too, for deploying its stack (manual §10).
+# It may belong to a third party who deploys it with their own credentials, so
+# a profile that cannot reach it is a warning here, not a failure.
+if [ -z "$ANALYSIS" ]; then
+    ANALYSIS_PROFILE=""
+elif [ "$ANALYSIS" = "$ORCH" ]; then
+    ANALYSIS_PROFILE="$ORCH_PROFILE"
+elif [ "$ANALYSIS" = "$EVID" ]; then
+    ANALYSIS_PROFILE="$EVID_PROFILE"
+else
+    BEFORE="$FAILED"
+    ensure_profile "$ANALYSIS_PROFILE" "$ANALYSIS"; ANALYSIS_PROFILE="$CHOSEN"
+    if [ "$FAILED" != "$BEFORE" ]; then
+        FAILED="$BEFORE"
+        echo "        Not fatal: needed only if you deploy the analysis stack yourself." >&2
+        ANALYSIS_PROFILE=""
+    fi
+fi
 FIRST_MEMBER="${NORMALIZED[0]%%=*}"
 FIRST_PROFILE="${NORMALIZED[0]#*=}"
 echo
@@ -480,6 +499,7 @@ TMP="$(mktemp "${CONFIG_FILE}.XXXXXX")"
     echo "export FIP_SOURCE_PROFILE=$SOURCE_PROFILE"
     echo "export FIP_ORCHESTRATOR_PROFILE=$ORCH_PROFILE"
     echo "export FIP_EVIDENCE_PROFILE=$EVID_PROFILE"
+    echo "export FIP_ANALYSIS_PROFILE=$ANALYSIS_PROFILE"
     echo "export FIP_MEMBER_PROFILE=$FIRST_PROFILE"
     echo "export FIP_DEPLOY_RESPONDER=$RESPONDER"
     echo "export FIP_ALLOW_RESTORE=$ALLOW_RESTORE"

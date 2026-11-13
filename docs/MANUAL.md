@@ -13,9 +13,9 @@ commands, for when `fip` is unavailable. Teardown lives in
 
 > **Status.** Acquisition, containment, evidence copy and signed manifests are built and
 > exercised against live instances (Linux and Windows, standalone and in Auto Scaling
-> groups), as are incident cases (§5) and the evidence release path. Large fleet-scale
-> runs and the isolated analysis workstation are built but have not yet been exercised
-> against live instances. Memory capture, detonation and GuardDuty triggers are **not**
+> groups), as are incident cases (§5), the evidence release path and the isolated
+> analysis workstation (§10). Large fleet-scale runs are built but have not yet been
+> exercised at scale. Memory capture, detonation and GuardDuty triggers are **not**
 > built.
 > See [What FIP does not do](#13-what-fip-does-not-do).
 
@@ -505,7 +505,7 @@ saved is offered as the default.
 | `--region R` | Default `us-east-1` |
 | `--orchestrator ID`, `--evidence ID` | The two central accounts. They may be the same |
 | `--member ID[=PROFILE]` | An account FIP covers. Repeatable. `=PROFILE` names an existing profile for it |
-| `--analysis ID` / `--no-analysis` | The optional account where examiners work (§10) |
+| `--analysis ID` / `--no-analysis` | The optional account where examiners work (§10). Also creates a `fip-analysis` profile for it; if that account cannot be reached, as when a third party holds it, that is a warning, not a failure |
 | `--org-id ID` / `--no-org` | Your AWS Organizations id, or `--no-org` if you have none. Looked up if omitted; if the lookup fails, `fip deploy` stops until you give one of the two |
 | `--admin-role NAME` | The role FIP's profiles assume in each account. Default `AWSControlTowerExecution`; accounts made by AWS Organizations usually have `OrganizationAccountAccessRole` |
 | `--source-profile NAME` | Credentials those profiles start from. Default `default` |
@@ -1229,8 +1229,8 @@ quietly remove it.
 ### Deploy
 
 Replace the example number below with your analysis account id. This needs a
-`fip-analysis` profile for that account. If it is in your organization,
-add it with `fip configure --analysis` (§6.1). If a third party holds it, they run this step
+`fip-analysis` profile for that account, which `fip configure --analysis` creates (§6.1)
+when the account is in your organization. If a third party holds it, they run this step
 with their own credentials.
 
 From the `cdk` directory of your checkout:
@@ -1493,9 +1493,9 @@ does less.
 - **No detection.** `fip instances` lists what is there; deciding which instances are
   compromised is yours.
 - **Single region per deployment.**
-- **No forensic tooling of its own.** §10 gives you an isolated workstation with
-  `sleuthkit` and nothing else. Examiners bring their own tools in (§10, "Bring tools
-  in"), and FIP has no opinion about which. Tools that need the internet at run time
+- **No forensic tooling of its own.** §10 gives you an isolated Amazon Linux 2023
+  workstation with filesystem tools and nothing else. Examiners bring their own tools
+  in (§10, "Bring tools in"), and FIP has no opinion about which. Tools that need the internet at run time
   will not work there.
 - **No automated evidence delivery.** Releasing evidence to the analysis account is a
   deliberate, human-initiated step (§10), not something a case does on its own.
