@@ -51,6 +51,15 @@ if [ "${#MEMBERS[@]}" -eq 0 ] && [ -f "$CONFIG_FILE" ]; then
         MEMBERS+=("${m%%=*}")
     done
 fi
+# The evidence-account checks that FipEvidenceRole cannot make (its own grant,
+# Object Lock) use the evidence profile `fip configure` saved, so they run on
+# a standard install instead of being skipped.
+EVID_PROFILE=""
+if [ -f "$CONFIG_FILE" ]; then
+    EVID_PROFILE="$(sed -n 's/^export FIP_EVIDENCE_PROFILE="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$CONFIG_FILE" | tail -1)"
+fi
+EVID_ARGS=()
+[ -z "$EVID_PROFILE" ] || EVID_ARGS=(--profile "$EVID_PROFILE")
 
 PASS=0; WARN=0; FAIL=0
 
@@ -160,12 +169,12 @@ if [ -n "$EVIDENCE_ACCOUNT" ]; then
         #
         # What is checked instead is the GRANT, read with the caller's own
         # credentials. Static rather than live, and labeled as such.
-        EV_POLICY="$(aws iam list-role-policies --role-name FipEvidenceRole \
+        EV_POLICY="$(aws iam list-role-policies ${EVID_ARGS[@]+"${EVID_ARGS[@]}"} --role-name FipEvidenceRole \
             --query 'PolicyNames[0]' --output text 2>/dev/null || echo '')"
         if [ -z "$EV_POLICY" ] || [ "$EV_POLICY" = "None" ]; then
             warn "evidence bucket write grant not checked — needs credentials in the evidence account"
         else
-            EV_DOC="$(aws iam get-role-policy --role-name FipEvidenceRole \
+            EV_DOC="$(aws iam get-role-policy ${EVID_ARGS[@]+"${EVID_ARGS[@]}"} --role-name FipEvidenceRole \
                 --policy-name "$EV_POLICY" --query 'PolicyDocument' --output json 2>/dev/null || echo '{}')"
             if jq -e --arg b "arn:aws:s3:::${BUCKET}/cases/*" '
                     [.Statement[] | select((.Action|tostring) | contains("s3:PutObject"))
@@ -188,7 +197,7 @@ if [ -n "$EVIDENCE_ACCOUNT" ]; then
         # that role must never inspect or alter retention. So this check needs
         # the caller's own credentials in the evidence account, and is SKIPPED
         # rather than failed when the caller does not have them.
-        LOCK="$(aws s3api get-object-lock-configuration --bucket "$BUCKET" \
+        LOCK="$(aws s3api get-object-lock-configuration ${EVID_ARGS[@]+"${EVID_ARGS[@]}"} --bucket "$BUCKET" \
             --region "$REGION" --output json 2>/dev/null || echo '')"
         if [ -z "$LOCK" ]; then
             warn "Object Lock not checked — needs credentials in the evidence account, not FipEvidenceRole"
